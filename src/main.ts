@@ -246,6 +246,14 @@ async function runDaemon(): Promise<void> {
     process.exit(1);
   }
 
+  // Fail closed: the bound owner's userId is the only thing gating who can drive
+  // Claude on this machine. If it is missing, every sender would be authorized —
+  // refuse to start rather than run wide open. Re-run setup to rebind.
+  if (!account.userId) {
+    console.error('账号缺少绑定用户 (userId)，拒绝启动。请重新运行 node dist/main.js setup 完成绑定。');
+    process.exit(1);
+  }
+
   const api = new WeChatApi(account.botToken, account.baseUrl);
   const sessionStore = createSessionStore();
   const session: Session = sessionStore.load(account.accountId);
@@ -286,6 +294,9 @@ async function runDaemon(): Promise<void> {
   /** Handle priority commands (/stop, /clear) immediately, bypassing the serial queue. */
   function handlePriorityCommand(msg: WeixinMessage): boolean {
     if (msg.message_type !== MessageType.USER || !msg.item_list) return false;
+    // Same sender guard as the main message path — priority commands must not
+    // be a way for an unbound sender to abort/clear the owner's session.
+    if (account!.userId && msg.from_user_id !== account!.userId) return false;
     const text = extractTextFromItems(msg.item_list);
     if (!text.startsWith('/stop') && !text.startsWith('/clear')) return false;
     if (session.state !== 'processing') return false;
@@ -609,7 +620,11 @@ async function sendToClaude(
       }
     } else if (result.error) {
       logger.error('Claude query error', { error: result.error });
-      await sender.sendText(fromUserId, contextToken, 'Claude 处理请求时出错，请稍后重试。');
+      // Surface the actual error (truncated) instead of a generic message — the
+      // most common first-run failures (claude not on PATH, auth failure) are
+      // otherwise invisible from the phone and only visible in the daemon log.
+      const detail = String(result.error).slice(0, 300);
+      await sender.sendText(fromUserId, contextToken, `Claude 处理请求时出错：${detail}`);
     } else if (!anySent) {
       await sender.sendText(fromUserId, contextToken, 'Claude 无返回内容（可能因权限被拒而终止）');
     }

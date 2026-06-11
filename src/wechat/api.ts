@@ -14,6 +14,23 @@ function generateUin(): string {
   return Buffer.from(buf).toString('base64');
 }
 
+const TRUSTED_HOSTS = ['weixin.qq.com', 'wechat.com'];
+
+/**
+ * Whether a URL is an https endpoint on a trusted WeChat/Tencent host. Used to
+ * vet both the configured baseUrl and any server-supplied URL (e.g. CDN upload
+ * targets) before we send encrypted file contents to it.
+ */
+export function isTrustedWechatUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:') return false;
+    return TRUSTED_HOSTS.some(h => url.hostname === h || url.hostname.endsWith('.' + h));
+  } catch {
+    return false;
+  }
+}
+
 export class WeChatApi {
   private readonly token: string;
   private readonly baseUrl: string;
@@ -22,19 +39,9 @@ export class WeChatApi {
   private static readonly MIN_SEND_INTERVAL = 2500;
 
   constructor(token: string, baseUrl: string = 'https://ilinkai.weixin.qq.com') {
-    if (baseUrl) {
-      try {
-        const url = new URL(baseUrl);
-        const allowedHosts = ['weixin.qq.com', 'wechat.com'];
-        const isAllowed = allowedHosts.some(h => url.hostname === h || url.hostname.endsWith('.' + h));
-        if (url.protocol !== 'https:' || !isAllowed) {
-          logger.warn('Untrusted baseUrl, using default', { baseUrl });
-          baseUrl = 'https://ilinkai.weixin.qq.com';
-        }
-      } catch {
-        logger.warn('Invalid baseUrl, using default', { baseUrl });
-        baseUrl = 'https://ilinkai.weixin.qq.com';
-      }
+    if (baseUrl && !isTrustedWechatUrl(baseUrl)) {
+      logger.warn('Untrusted baseUrl, using default', { baseUrl });
+      baseUrl = 'https://ilinkai.weixin.qq.com';
     }
     this.token = token;
     this.baseUrl = baseUrl.replace(/\/+$/, '');

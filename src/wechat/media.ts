@@ -124,8 +124,18 @@ export async function downloadFile(item: MessageItem): Promise<string | null> {
     const decrypted = await downloadAndDecrypt(encryptQueryParam, aesKey);
     const tmpDir = path.join(os.tmpdir(), 'wechat-claude-code');
     fs.mkdirSync(tmpDir, { recursive: true });
-    const fileName = fileItem.file_name || `file-${Date.now()}.bin`;
+    // Strip any directory components from the server-supplied name to keep the
+    // write contained in tmpDir (prevents path traversal via crafted file_name).
+    const rawName = fileItem.file_name || `file-${Date.now()}.bin`;
+    const fileName = path.basename(rawName) || `file-${Date.now()}.bin`;
     const filePath = path.join(tmpDir, fileName);
+    // Defense in depth: confirm the resolved path is actually inside tmpDir
+    // before writing, in case basename ever fails to fully contain the name.
+    const resolvedDir = path.resolve(tmpDir);
+    if (path.dirname(path.resolve(filePath)) !== resolvedDir) {
+      logger.warn('Rejected unsafe file name', { rawName });
+      return null;
+    }
     fs.writeFileSync(filePath, decrypted);
     logger.info('File downloaded and saved', { path: filePath, size: decrypted.length, name: fileName });
     return filePath;

@@ -109,8 +109,10 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
   let errorMessage: string | undefined;
   let child: ChildProcess | undefined;
   let settled = false;
+  let killGraceTimer: ReturnType<typeof setTimeout> | undefined;
 
   const QUERY_TIMEOUT_MS = 60 * 60 * 1000;
+  const KILL_GRACE_MS = 5000;
 
   return new Promise<QueryResult>((resolve) => {
     const finish = (result: QueryResult) => {
@@ -118,6 +120,21 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
       settled = true;
       cleanupTempFiles(tempImagePaths);
       resolve(result);
+    };
+
+    // Terminate the child gracefully, then force-kill if it ignores SIGTERM so
+    // an unresponsive claude process can't linger as a zombie after timeout/abort.
+    const terminateChild = () => {
+      if (!child || child.exitCode !== null || child.signalCode !== null) return;
+      child.kill('SIGTERM');
+      killGraceTimer = setTimeout(() => {
+        try {
+          if (child && child.exitCode === null && child.signalCode === null) {
+            child.kill('SIGKILL');
+          }
+        } catch { /* already gone */ }
+      }, KILL_GRACE_MS);
+      killGraceTimer.unref?.();
     };
 
     try {
@@ -139,7 +156,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     // Timeout
     const timeoutId = setTimeout(() => {
       logger.warn('Claude CLI query timed out, killing process');
-      child!.kill('SIGTERM');
+      terminateChild();
       const partialText = textParts.join('\n').trim();
       finish({
         text: partialText,
@@ -151,7 +168,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     // Abort handling
     const onAbort = () => {
       logger.info('Claude CLI query aborted');
-      child!.kill('SIGTERM');
+      terminateChild();
       const partialText = textParts.join('\n').trim();
       finish({ text: partialText, sessionId });
     };
@@ -249,6 +266,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     // Handle process exit
     child.on('close', (code: number | null) => {
       clearTimeout(timeoutId);
+      if (killGraceTimer) clearTimeout(killGraceTimer);
       abortController?.signal.removeEventListener('abort', onAbort);
 
       if (code !== 0 && code !== null && !textParts.length && !errorMessage) {

@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import { basename, extname } from 'node:path';
 import { encryptAesEcb, aesEcbPaddedSize } from './crypto.js';
-import { WeChatApi } from './api.js';
+import { WeChatApi, isTrustedWechatUrl } from './api.js';
 import { UploadMediaType } from './types.js';
 import { CDN_BASE_URL } from '../constants.js';
 import { logger } from '../logger.js';
@@ -77,6 +77,12 @@ export async function uploadFile(
   // Build CDN upload URL
   let uploadUrl: string;
   if (uploadResp.upload_full_url) {
+    // The upload target comes from the API response — vet it against the same
+    // trusted-host allowlist before POSTing encrypted file bytes to it, so a
+    // spoofed/MITM'd response can't redirect uploads to an attacker host.
+    if (!isTrustedWechatUrl(uploadResp.upload_full_url)) {
+      throw new Error('上传地址不可信，已拒绝上传');
+    }
     uploadUrl = uploadResp.upload_full_url;
   } else {
     uploadUrl = `${CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(uploadResp.upload_param!)}&filekey=${fileKey}`;
