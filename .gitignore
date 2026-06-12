@@ -4,4 +4,3 @@ dist/
 .env
 .wechat-claude-code/
 .claude/
-CLAUDE.md
