@@ -1,6 +1,6 @@
 import type { CommandContext, CommandResult } from './router.js';
 import { scanAllSkills, formatSkillList, findSkill, type SkillInfo } from '../claude/skill-scanner.js';
-import { loadConfig, saveConfig } from '../config.js';
+import { loadConfig } from '../config.js';
 import { DEFAULT_WORKING_DIR } from '../constants.js';
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve, basename, join } from 'node:path';
@@ -174,23 +174,23 @@ export function handleVersion(): CommandResult {
   }
 }
 
-export function handlePrompt(_ctx: CommandContext, args: string): CommandResult {
-  const config = loadConfig();
+export function handlePrompt(ctx: CommandContext, args: string): CommandResult {
+  // Per-user: store on the session, not the global config, so one user's prompt
+  // does not leak into everyone else's Claude. Falls back to the global default.
+  const globalDefault = loadConfig().systemPrompt;
   if (!args) {
-    const current = config.systemPrompt;
+    const current = ctx.session.systemPrompt ?? globalDefault;
     if (current) {
       return { reply: `📝 当前系统提示词:\n${current}\n\n用法:\n/prompt <提示词>  — 设置\n/prompt clear   — 清除`, handled: true };
     }
     return { reply: '📝 暂无系统提示词\n\n用法: /prompt <提示词>\n例: /prompt 用中文回答我', handled: true };
   }
   if (args.trim().toLowerCase() === 'clear') {
-    config.systemPrompt = undefined;
-    saveConfig(config);
+    ctx.updateSession({ systemPrompt: undefined });
     return { reply: '✅ 系统提示词已清除', handled: true };
   }
-  config.systemPrompt = args.trim();
-  saveConfig(config);
-  return { reply: `✅ 系统提示词已设置:\n${config.systemPrompt}`, handled: true };
+  ctx.updateSession({ systemPrompt: args.trim() });
+  return { reply: `✅ 系统提示词已设置:\n${args.trim()}`, handled: true };
 }
 
 export function handleSend(ctx: CommandContext, args: string): CommandResult {

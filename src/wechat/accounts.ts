@@ -62,3 +62,22 @@ export function loadLatestAccount(): AccountData | null {
     return null;
   }
 }
+
+/**
+ * Load every bound account. Each ilink bot is 1:1 with the WeChat user who
+ * scanned to bind it, so serving multiple employees means running one bot per
+ * person — this returns all of them for the daemon to poll concurrently.
+ */
+export function loadAllAccounts(): AccountData[] {
+  try {
+    const files = readdirSync(ACCOUNTS_DIR).filter((f) => f.endsWith('.json'));
+    const accounts: AccountData[] = [];
+    for (const file of files) {
+      const account = loadAccount(file.replace(/\.json$/, ''));
+      if (account) accounts.push(account);
+    }
+    return accounts;
+  } catch {
+    return [];
+  }
+}

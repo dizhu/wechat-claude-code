@@ -19,6 +19,10 @@ export interface Session {
   previousSdkSessionId?: string;
   workingDirectory: string;
   model?: string;
+  /** Per-user system prompt set via /prompt. Falls back to the global config value. */
+  systemPrompt?: string;
+  /** Set once the per-user working directory has been assigned, so it is not re-derived on every restart. */
+  workspaceInitialized?: boolean;
   state: SessionState;
   chatHistory: ChatMessage[];
   maxHistoryLength?: number;
@@ -70,6 +74,8 @@ export function createSessionStore() {
       previousSdkSessionId: undefined,
       workingDirectory: currentSession?.workingDirectory ?? DEFAULT_WORKING_DIR,
       model: currentSession?.model,
+      systemPrompt: currentSession?.systemPrompt,
+      workspaceInitialized: currentSession?.workspaceInitialized,
       state: 'idle',
       chatHistory: [],
       maxHistoryLength: currentSession?.maxHistoryLength || DEFAULT_MAX_HISTORY,

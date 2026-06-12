@@ -1,13 +1,20 @@
-import { loadJson, saveJson } from '../store.js';
+import { loadJson, saveJson, validateAccountId } from '../store.js';
 import { DATA_DIR } from '../constants.js';
 import { join } from 'node:path';
 
-const SYNC_BUF_PATH = join(DATA_DIR, 'get_updates_buf');
-
-export function loadSyncBuf(): string {
-  return loadJson<string>(SYNC_BUF_PATH, '');
+// The long-poll cursor (get_updates_buf) is BOT-SPECIFIC — it encodes a
+// position in one bot's update stream. With multiple bots polling concurrently,
+// a single shared file would let them overwrite each other's cursor, causing
+// missed/duplicated messages. Key it per bot account instead.
+function syncBufPath(accountId: string): string {
+  validateAccountId(accountId);
+  return join(DATA_DIR, 'sync', `${accountId}.json`);
 }
 
-export function saveSyncBuf(buf: string): void {
-  saveJson(SYNC_BUF_PATH, buf);
+export function loadSyncBuf(accountId: string): string {
+  return loadJson<string>(syncBufPath(accountId), '');
+}
+
+export function saveSyncBuf(accountId: string, buf: string): void {
+  saveJson(syncBufPath(accountId), buf);
 }

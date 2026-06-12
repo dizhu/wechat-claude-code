@@ -65,10 +65,16 @@ export async function uploadFile(
     },
   });
 
-  logger.info('Upload URL response', { uploadResp });
+  // Log only a safe summary — the raw response may carry key material in fields
+  // the redactor doesn't reach (nested/renamed AES keys).
+  logger.info('Upload URL response', {
+    ret: uploadResp.ret,
+    hasUploadUrl: !!uploadResp.upload_full_url,
+    hasUploadParam: !!uploadResp.upload_param,
+  });
 
   if (!uploadResp.upload_full_url && !uploadResp.upload_param) {
-    throw new Error(`获取上传地址失败: ${JSON.stringify(uploadResp)}`);
+    throw new Error('获取上传地址失败');
   }
 
   // Encrypt

@@ -6,7 +6,7 @@ import { unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 
 import { WeChatApi } from './wechat/api.js';
-import { saveAccount, loadLatestAccount, type AccountData } from './wechat/accounts.js';
+import { saveAccount, loadAllAccounts, type AccountData } from './wechat/accounts.js';
 import { startQrLogin, waitForQrScan } from './wechat/login.js';
 import { createMonitor, type MonitorCallbacks } from './wechat/monitor.js';
 import { createSender } from './wechat/send.js';
@@ -16,7 +16,7 @@ import { routeCommand, type CommandContext, type CommandResult } from './command
 import { claudeQuery, type QueryOptions } from './claude/provider.js';
 import { loadConfig, saveConfig } from './config.js';
 import { logger } from './logger.js';
-import { DATA_DIR } from './constants.js';
+import { DATA_DIR, DEFAULT_WORKING_DIR } from './constants.js';
 import { MessageType, type WeixinMessage } from './wechat/types.js';
 
 // ---------------------------------------------------------------------------
@@ -239,109 +239,211 @@ async function runSetup(): Promise<void> {
 
 async function runDaemon(): Promise<void> {
   const config = loadConfig();
-  const account = loadLatestAccount();
+  const accounts = loadAllAccounts();
 
-  if (!account) {
+  if (accounts.length === 0) {
     console.error('未找到账号，请先运行 node dist/main.js setup');
     process.exit(1);
   }
 
-  // Fail closed: the bound owner's userId is the only thing gating who can drive
-  // Claude on this machine. If it is missing, every sender would be authorized —
-  // refuse to start rather than run wide open. Re-run setup to rebind.
-  if (!account.userId) {
-    console.error('账号缺少绑定用户 (userId)，拒绝启动。请重新运行 node dist/main.js setup 完成绑定。');
-    process.exit(1);
-  }
-
-  const api = new WeChatApi(account.botToken, account.baseUrl);
-  const sessionStore = createSessionStore();
-  const session: Session = sessionStore.load(account.accountId);
-
-  // Fix: backfill session workingDirectory from config if it's still the default process.cwd()
-  if (config.workingDirectory && session.workingDirectory === process.cwd()) {
-    session.workingDirectory = config.workingDirectory;
-    sessionStore.save(account.accountId, session);
-  }
-
-  // Fix: reset stale non-idle state on startup (e.g. after crash)
-  if (session.state !== 'idle') {
-    logger.warn('Resetting stale session state on startup', { state: session.state });
-    session.state = 'idle';
-    sessionStore.save(account.accountId, session);
-  }
-
-  const sender = createSender(api, account.accountId);
-  const sharedCtx = { lastContextToken: '' };
-  const activeControllers = new Map<string, AbortController>();
-
-  // -- Message queue for serial processing --
-  const messageQueue: WeixinMessage[] = [];
-  let processingQueue = false;
-
-  async function drainQueue(): Promise<void> {
-    if (processingQueue) return;
-    processingQueue = true;
-    while (messageQueue.length > 0) {
-      const msg = messageQueue.shift()!;
-      await handleMessage(msg, account!, session, sessionStore, sender, config, sharedCtx, activeControllers, messageQueue);
+  // Fail closed per account: a bot with no bound owner would authorize every
+  // sender, so skip it rather than run that bot wide open. Also validate the
+  // accountId up front — it is used as a path component (sync cursor, session
+  // keys); an invalid one would otherwise throw mid-poll and hot-restart.
+  const usable = accounts.filter((a) => {
+    if (!a.userId) {
+      console.error(`账号 ${a.accountId} 缺少绑定用户 (userId)，已跳过。请重新 setup 绑定。`);
+      return false;
     }
-    processingQueue = false;
-  }
-
-  // -- Wire the monitor callbacks --
-
-  /** Handle priority commands (/stop, /clear) immediately, bypassing the serial queue. */
-  function handlePriorityCommand(msg: WeixinMessage): boolean {
-    if (msg.message_type !== MessageType.USER || !msg.item_list) return false;
-    // Same sender guard as the main message path — priority commands must not
-    // be a way for an unbound sender to abort/clear the owner's session.
-    if (account!.userId && msg.from_user_id !== account!.userId) return false;
-    const text = extractTextFromItems(msg.item_list);
-    if (!text.startsWith('/stop') && !text.startsWith('/clear')) return false;
-    if (session.state !== 'processing') return false;
-
-    const ctrl = activeControllers.get(account!.accountId);
-    if (ctrl) { ctrl.abort(); activeControllers.delete(account!.accountId); }
-    session.state = 'idle';
-    sessionStore.save(account!.accountId, session);
-
-    if (text.startsWith('/stop')) {
-      messageQueue.length = 0;
-      sender.sendText(msg.from_user_id!, msg.context_token ?? '', '⏹ 已停止当前对话，排队中的消息已清空。').catch(() => {});
+    if (!/^[a-zA-Z0-9_.@=-]+$/.test(a.accountId)) {
+      console.error(`账号 id 非法（含特殊字符），已跳过: ${a.accountId}`);
+      return false;
     }
     return true;
-  }
+  });
+  if (usable.length === 0) process.exit(1);
 
-  const callbacks: MonitorCallbacks = {
-    onMessage: async (msg: WeixinMessage) => {
-      if (handlePriorityCommand(msg)) return;
-      messageQueue.push(msg);
-      drainQueue();
-    },
-    onSessionExpired: () => {
-      logger.warn('Session expired, will keep retrying...');
-      console.error('⚠️ 微信会话已过期，请重新运行 setup 扫码绑定');
-    },
-  };
-
-  const monitor = createMonitor(api, callbacks);
+  const sessionStore = createSessionStore();
+  const monitors = usable.map((account) => createBotMonitor(account, sessionStore, config));
 
   // -- Graceful shutdown --
 
   function shutdown(): void {
     logger.info('Shutting down...');
-    monitor.stop();
+    for (const m of monitors) m.stop();
     process.exit(0);
   }
 
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  logger.info('Daemon started', { accountId: account.accountId });
-  console.log(`已启动 (账号: ${account.accountId})`);
+  logger.info('Daemon started', { bots: usable.length });
+  console.log(`已启动 (${usable.length} 个 bot: ${usable.map((a) => a.accountId).join(', ')})`);
 
-  await monitor.run();
+  // Isolate failures: if one bot's polling loop throws, restart just that bot
+  // after a short delay instead of letting Promise.all bring down every bot.
+  async function runResilient(m: ReturnType<typeof createMonitor>, label: string): Promise<void> {
+    while (true) {
+      try {
+        await m.run();
+        return; // clean stop()
+      } catch (err) {
+        logger.error('Bot monitor crashed, restarting in 10s', { label, error: err instanceof Error ? err.message : String(err) });
+        await new Promise((r) => setTimeout(r, 10_000));
+      }
+    }
+  }
+  await Promise.all(monitors.map((m, i) => runResilient(m, usable[i].accountId)));
+}
+
+/**
+ * Set up one bot's polling loop. Each ilink bot is 1:1 with its bound WeChat
+ * user, so one of these runs per employee. All bots share the machine and the
+ * session store but keep isolated per-user runtimes and abort controllers.
+ * Returns the monitor; the caller runs and stops it.
+ */
+function createBotMonitor(
+  account: AccountData,
+  sessionStore: ReturnType<typeof createSessionStore>,
+  config: ReturnType<typeof loadConfig>,
+): ReturnType<typeof createMonitor> {
+  const api = new WeChatApi(account.botToken, account.baseUrl);
+  const sender = createSender(api, account.accountId);
+
+  // Abort controllers keyed by from_user_id (one in-flight query per user).
+  const activeControllers = new Map<string, AbortController>();
+
+  // Per-user runtime: isolated session, queue, and processing flag so different
+  // senders on this bot run concurrently; each user's own messages stay serial.
+  interface UserRuntime {
+    session: Session;
+    queue: WeixinMessage[];
+    processing: boolean;
+  }
+  const runtimes = new Map<string, UserRuntime>();
+
+  const owner = account.userId;
+  const baseDir = (config.workingDirectory || process.cwd()).replace(/^~/, homedir());
+
+  /**
+   * Session-store key namespacing a user's state under this bot. userIds with
+   * characters outside the store's allowed set are base64url-encoded so the key
+   * never throws validation. Both branches carry a distinct prefix (`r_` raw,
+   * `b_` encoded) so the two namespaces are disjoint by construction — a raw id
+   * can never collide with the encoding of a different id.
+   */
+  function sessionKeyFor(userId: string): string {
+    const safeUserId = /^[a-zA-Z0-9_.@=-]+$/.test(userId)
+      ? `r_${userId}`
+      : `b_${Buffer.from(userId).toString('base64url')}`;
+    return `${account.accountId}__${safeUserId}`;
+  }
+
+  /** Filesystem-safe short id for a per-user working directory. */
+  function shortId(userId: string): string {
+    return userId.replace(/@.*$/, '').replace(/[^a-zA-Z0-9_-]/g, '') || 'user';
+  }
+
+  /** Owner is always allowed; everyone else must be in the config allowlist. */
+  function isAuthorized(userId: string): boolean {
+    if (userId === owner) return true;
+    return (config.authorizedUsers ?? []).includes(userId);
+  }
+
+  /** Lazily create/restore an isolated runtime for a user on first contact. */
+  function getRuntime(userId: string): UserRuntime {
+    const existing = runtimes.get(userId);
+    if (existing) return existing;
+
+    const key = sessionKeyFor(userId);
+    const session = sessionStore.load(key);
+
+    // First sighting of this user: give them their own working directory so
+    // employees don't clobber each other's files at the cwd level. Done once
+    // (guarded by workspaceInitialized) so a later /cwd back to the default is
+    // not silently relocated on the next restart.
+    if (!session.workspaceInitialized) {
+      if (!session.workingDirectory
+        || session.workingDirectory === process.cwd()
+        || session.workingDirectory === DEFAULT_WORKING_DIR) {
+        session.workingDirectory = join(baseDir, shortId(userId));
+      }
+      session.workspaceInitialized = true;
+    }
+    try { mkdirSync(session.workingDirectory, { recursive: true }); } catch { /* best effort */ }
+
+    // Reset stale non-idle state left over from a crash.
+    if (session.state !== 'idle') {
+      logger.warn('Resetting stale session state on startup', { userId, state: session.state });
+      session.state = 'idle';
+    }
+    sessionStore.save(key, session);
+
+    const rt: UserRuntime = { session, queue: [], processing: false };
+    runtimes.set(userId, rt);
+    return rt;
+  }
+
+  async function drainQueue(userId: string): Promise<void> {
+    const rt = getRuntime(userId);
+    if (rt.processing) return;
+    rt.processing = true;
+    try {
+      while (rt.queue.length > 0) {
+        const msg = rt.queue.shift()!;
+        await handleMessage(msg, account, sessionKeyFor(userId), rt.session, sessionStore, sender, config, activeControllers);
+      }
+    } finally {
+      // INVARIANT: clear `processing` BEFORE the queue check below. The re-enter
+      // guard at the top of drainQueue (`if (rt.processing) return`) is what
+      // prevents double-processing when a concurrent onMessage re-enters here —
+      // reordering these two lines would reintroduce that race.
+      rt.processing = false;
+      // If a handler threw (or a message arrived during the final await), make
+      // sure remaining messages aren't stranded until the user sends another.
+      if (rt.queue.length > 0) drainQueue(userId).catch(() => { /* logged downstream */ });
+    }
+  }
+
+  /** Handle /stop immediately, bypassing the per-user serial queue. */
+  function handlePriorityCommand(msg: WeixinMessage): boolean {
+    if (msg.message_type !== MessageType.USER || !msg.item_list || !msg.from_user_id) return false;
+    const userId = msg.from_user_id;
+    if (!isAuthorized(userId)) return false;
+    const text = extractTextFromItems(msg.item_list);
+    if (!text.startsWith('/stop')) return false;
+
+    const rt = getRuntime(userId);
+    const ctrl = activeControllers.get(userId);
+    if (ctrl) { ctrl.abort(); activeControllers.delete(userId); }
+    rt.queue.length = 0;
+    rt.session.state = 'idle';
+    sessionStore.save(sessionKeyFor(userId), rt.session);
+    sender.sendText(userId, msg.context_token ?? '', '⏹ 已停止当前对话，排队中的消息已清空。').catch(() => {});
+    return true;
+  }
+
+  const callbacks: MonitorCallbacks = {
+    onMessage: async (msg: WeixinMessage) => {
+      const userId = msg.from_user_id;
+      if (msg.message_type !== MessageType.USER || !userId) return;
+      if (!isAuthorized(userId)) {
+        // Log the id so the owner can add it to config.authorizedUsers; stay
+        // silent to the sender (no reflected replies to unauthorized users).
+        logger.warn('Dropped message from unauthorized sender', { botId: account.accountId, userId });
+        return;
+      }
+      if (handlePriorityCommand(msg)) return;
+      getRuntime(userId).queue.push(msg);
+      drainQueue(userId);
+    },
+    onSessionExpired: () => {
+      logger.warn('Session expired, will keep retrying...', { botId: account.accountId });
+      console.error(`⚠️ 微信会话已过期 (${account.accountId})，请重新运行 setup 扫码绑定`);
+    },
+  };
+
+  return createMonitor(api, callbacks, account.accountId);
 }
 
 // ---------------------------------------------------------------------------
@@ -351,22 +453,20 @@ async function runDaemon(): Promise<void> {
 async function handleMessage(
   msg: WeixinMessage,
   account: AccountData,
+  sessionKey: string,
   session: Session,
   sessionStore: ReturnType<typeof createSessionStore>,
   sender: ReturnType<typeof createSender>,
   config: ReturnType<typeof loadConfig>,
-  sharedCtx: { lastContextToken: string },
   activeControllers: Map<string, AbortController>,
-  messageQueue: WeixinMessage[],
 ): Promise<void> {
-  // Filter: only user messages with required fields
+  // Filter: only user messages with required fields. (Authorization is enforced
+  // upstream in the monitor callback before the message is ever queued.)
   if (msg.message_type !== MessageType.USER) return;
   if (!msg.from_user_id || !msg.item_list) return;
-  if (account.userId && msg.from_user_id !== account.userId) return;
 
   const contextToken = msg.context_token ?? '';
   const fromUserId = msg.from_user_id;
-  sharedCtx.lastContextToken = contextToken;
 
   // Extract text from items
   const userText = extractTextFromItems(msg.item_list);
@@ -383,14 +483,18 @@ async function handleMessage(
   if (userText.startsWith('/')) {
     const updateSession = (partial: Partial<Session>) => {
       Object.assign(session, partial);
-      sessionStore.save(account.accountId, session);
+      sessionStore.save(sessionKey, session);
     };
 
     const ctx: CommandContext = {
-      accountId: account.accountId,
+      accountId: sessionKey,
       session,
       updateSession,
-      clearSession: () => sessionStore.clear(account.accountId),
+      clearSession: () => {
+        const cleared = sessionStore.clear(sessionKey, session);
+        Object.assign(session, cleared);
+        return session;
+      },
       getChatHistoryText: (limit?: number) => sessionStore.getChatHistoryText(session, limit),
       text: userText,
     };
@@ -405,7 +509,7 @@ async function handleMessage(
     if (result.handled && result.claudePrompt) {
       await sendToClaude(
         result.claudePrompt, imageItem, fileItem, fromUserId, contextToken,
-        account, session, sessionStore, sender, config, activeControllers,
+        account, sessionKey, session, sessionStore, sender, config, activeControllers,
       );
       return;
     }
@@ -429,7 +533,7 @@ async function handleMessage(
 
   await sendToClaude(
     userText, imageItem, fileItem, fromUserId, contextToken,
-    account, session, sessionStore, sender, config, activeControllers,
+    account, sessionKey, session, sessionStore, sender, config, activeControllers,
   );
 }
 
@@ -444,6 +548,7 @@ async function sendToClaude(
   fromUserId: string,
   contextToken: string,
   account: AccountData,
+  sessionKey: string,
   session: Session,
   sessionStore: ReturnType<typeof createSessionStore>,
   sender: ReturnType<typeof createSender>,
@@ -452,11 +557,11 @@ async function sendToClaude(
 ): Promise<void> {
   // Set state to processing
   session.state = 'processing';
-  sessionStore.save(account.accountId, session);
+  sessionStore.save(sessionKey, session);
 
   // Create abort controller for this query so it can be cancelled by new messages
   const abortController = new AbortController();
-  activeControllers.set(account.accountId, abortController);
+  activeControllers.set(fromUserId, abortController);
 
   // Flush timer for streaming text to WeChat during query (declared here for finally cleanup)
   let flushTimer: ReturnType<typeof setInterval> | undefined;
@@ -566,7 +671,7 @@ async function sendToClaude(
       model: session.model,
       systemPrompt: [
         '你正在通过微信与用户对话，不是在终端里。不要让用户去终端操作。如果用户需要文件，直接输出文件地址就行，会自动识别解析推送文件到用户的微信中。',
-        config.systemPrompt,
+        session.systemPrompt ?? config.systemPrompt,
       ].filter(Boolean).join('\n'),
       abortController,
       images,
@@ -591,14 +696,27 @@ async function sendToClaude(
 
     let result = await claudeQuery(queryOptions);
 
+    // Cancelled via /stop: leave the session as the priority handler set it
+    // (idle, queue cleared) and don't send partial output or persist the
+    // aborted run's session id. The flush timer is cleared in finally.
+    if (result.aborted) {
+      logger.info('Query aborted by /stop, discarding partial result');
+      return;
+    }
+
     // If resume failed (e.g. corrupted session), retry without resume
     if (result.error && queryOptions.resume) {
       logger.warn('Resume failed, retrying without resume', { error: result.error, sessionId: queryOptions.resume });
       queryOptions.resume = undefined;
       session.sdkSessionId = undefined;
-      sessionStore.save(account.accountId, session);
+      sessionStore.save(sessionKey, session);
       const retryResult = await claudeQuery(queryOptions);
       Object.assign(result, retryResult);
+      // The retry can also be aborted by /stop — re-check after merging.
+      if (result.aborted) {
+        logger.info('Query aborted by /stop during retry, discarding partial result');
+        return;
+      }
     }
 
     // Stop periodic flush and send any remaining buffered content
@@ -632,7 +750,7 @@ async function sendToClaude(
     // Update session with new SDK session ID
     session.sdkSessionId = result.sessionId || undefined;
     session.state = 'idle';
-    sessionStore.save(account.accountId, session);
+    sessionStore.save(sessionKey, session);
 
     // Auto-push deliverable files mentioned in Claude's response
     if (result.text) {
@@ -689,13 +807,13 @@ async function sendToClaude(
       await sender.sendText(fromUserId, contextToken, '处理消息时出错，请稍后重试。');
     }
     session.state = 'idle';
-    sessionStore.save(account.accountId, session);
+    sessionStore.save(sessionKey, session);
   } finally {
     clearInterval(flushTimer);
     stopTyping();
     // Clean up the abort controller if it's still ours
-    if (activeControllers.get(account.accountId) === abortController) {
-      activeControllers.delete(account.accountId);
+    if (activeControllers.get(fromUserId) === abortController) {
+      activeControllers.delete(fromUserId);
     }
   }
 }

@@ -31,6 +31,8 @@ export interface QueryResult {
   text: string;
   sessionId: string;
   error?: string;
+  /** Set when the query was cancelled via abort (e.g. /stop), not a normal finish. */
+  aborted?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +172,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
       logger.info('Claude CLI query aborted');
       terminateChild();
       const partialText = textParts.join('\n').trim();
-      finish({ text: partialText, sessionId });
+      finish({ text: partialText, sessionId, aborted: true });
     };
     abortController?.signal.addEventListener('abort', onAbort, { once: true });
 

@@ -1,33 +1,26 @@
 ---
 name: wechat-claude-code
-description: 微信消息桥接 - 在微信中与 Claude Code 聊天。支持文字对话、图片识别、实时进度推送、斜杠命令。
+description: 微信消息桥接 - 在微信中与 Claude Code 聊天。支持文字对话、图片识别、实时进度推送、斜杠命令、多成员（每人各绑一个 bot，会话隔离）。
 ---
 
 # WeChat Claude Code Bridge
 
-通过个人微信与本地 Claude Code 进行对话。
+通过个人微信与本地 Claude Code 进行对话。一个守护进程可同时服务多名成员（每人各绑一个独立 bot，会话/工作目录隔离）。
+
+> 本仓库是 [Wechat-ggGitHub/wechat-claude-code](https://github.com/Wechat-ggGitHub/wechat-claude-code) 的安全加固 + 多人 fork，详见 `LOCAL_PATCHES.md`。
+> ⚠️ **安全前提**：`claude` 以全权限运行，能给某个 bot 发消息 ≈ 能在宿主机执行任意命令。仅限可信成员，建议跑在不存敏感凭证的专用机器上。
 
 ## 前置条件
 
 - Node.js >= 18
-- macOS（daemon 使用 launchd 管理）
-- 个人微信账号（需扫码绑定）
-- 已安装 Claude Code（`@anthropic-ai/claude-agent-sdk`）
+- macOS（daemon 使用 launchd 管理）/ Linux（systemd）
+- 个人微信账号（每名成员各需一个）
+- 已安装 Claude Code CLI 并完成认证
 
 ## 安装
 
-**方式一：通过 skills CLI（推荐）**
-
 ```bash
-npx skills add Wechat-ggGitHub/wechat-claude-code
-```
-
-首次触发时 skill 会自动克隆完整项目源码并安装依赖。
-
-**方式二：手动克隆**
-
-```bash
-git clone https://github.com/Wechat-ggGitHub/wechat-claude-code.git ~/.claude/skills/wechat-claude-code
+git clone https://github.com/dizhu/wechat-claude-code.git ~/.claude/skills/wechat-claude-code
 cd ~/.claude/skills/wechat-claude-code && npm install
 ```
 
@@ -49,7 +42,7 @@ test -f ~/.claude/skills/wechat-claude-code/package.json && echo "source_ok" || 
 
 - 如果 `source_missing`：需要从 GitHub 克隆完整项目。执行：
   ```bash
-  git clone https://github.com/Wechat-ggGitHub/wechat-claude-code.git /tmp/wechat-claude-code-install && cp -r /tmp/wechat-claude-code-install/{src,scripts,*.ts,*.json,*.md,LICENSE} ~/.claude/skills/wechat-claude-code/ && rm -rf /tmp/wechat-claude-code-install
+  git clone https://github.com/dizhu/wechat-claude-code.git /tmp/wechat-claude-code-install && cp -r /tmp/wechat-claude-code-install/{src,scripts,*.ts,*.json,*.md,LICENSE} ~/.claude/skills/wechat-claude-code/ && rm -rf /tmp/wechat-claude-code-install
   ```
   然后继续检查依赖。
 
@@ -118,7 +111,7 @@ cd ~/.claude/skills/wechat-claude-code && npm run daemon -- status
 
 | 命令 | 执行 | 说明 |
 |------|------|------|
-| setup | `npm run setup` | 首次安装向导：生成 QR 码 → 微信扫码 → 配置工作目录 |
+| setup | `npm run setup` | 绑定向导：生成 QR 码 → 微信扫码 → 配置工作目录。**再次运行可为新成员绑定一个独立 bot**（成员用自己手机扫码，扫完 `restart` 即接入） |
 | start | `npm run daemon -- start` | 启动 launchd 守护进程（开机自启、自动重启） |
 | stop | `npm run daemon -- stop` | 停止守护进程 |
 | restart | `npm run daemon -- restart` | 重启守护进程 |
@@ -131,9 +124,11 @@ cd ~/.claude/skills/wechat-claude-code && npm run daemon -- status
 
 ```
 ~/.wechat-claude-code/
-├── accounts/       # 绑定的微信账号数据（每个账号一个 JSON）
-├── config.env      # 全局配置（工作目录、模型、系统提示词）
-├── sessions/       # 会话数据（每个账号一个 JSON）
-├── get_updates_buf # 消息轮询同步缓冲
+├── accounts/       # 各 bot 的微信账号凭证（每 bot 一个 <accountId>.json，0600）
+├── config.json     # 全局配置（工作目录、模型、系统提示词、authorizedUsers）
+├── sessions/       # 会话数据（按 <accountId>__<用户> 分文件，每成员独立）
+├── sync/           # 长轮询游标（每 bot 一个 <accountId>.json，互不覆盖）
 └── logs/           # 运行日志（每日轮转，保留 30 天）
 ```
+
+> 说明：守护进程会为 `accounts/` 下每个有效账号各起一条独立轮询循环；`status` 显示运行中的进程，启动日志显示服务的 bot 数量。

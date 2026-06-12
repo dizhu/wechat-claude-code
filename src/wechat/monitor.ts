@@ -14,7 +14,7 @@ export interface MonitorCallbacks {
   onSessionExpired: () => void;
 }
 
-export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks) {
+export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks, accountId: string) {
   const controller = new AbortController();
   let stopped = false;
   const recentMsgIds = new Set<number>();
@@ -25,7 +25,7 @@ export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks) {
 
     while (!controller.signal.aborted) {
       try {
-        const buf = loadSyncBuf();
+        const buf = loadSyncBuf(accountId);
         logger.debug('Polling for messages', { hasBuf: buf.length > 0 });
 
         const resp = await api.getUpdates(buf || undefined);
@@ -44,7 +44,7 @@ export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks) {
 
         // Save the new sync buffer regardless of ret
         if (resp.get_updates_buf) {
-          saveSyncBuf(resp.get_updates_buf);
+          saveSyncBuf(accountId, resp.get_updates_buf);
         }
 
         // Process messages (with deduplication)
