@@ -18,12 +18,18 @@ export async function downloadAndDecrypt(
   const timer = setTimeout(() => controller.abort(), 30_000);
   let response: Response;
   try {
-    response = await fetch(url, { signal: controller.signal });
+    // Don't follow redirects: the download host is the fixed trusted CDN base;
+    // a 3xx could steer the fetch to an untrusted host.
+    response = await fetch(url, { signal: controller.signal, redirect: 'manual' });
   } catch (err) {
     clearTimeout(timer);
     throw new Error(`CDN download failed: ${err instanceof Error ? err.message : String(err)}`);
   }
   clearTimeout(timer);
+
+  if (response.status >= 300 && response.status < 400) {
+    throw new Error(`CDN download redirected, refused (status ${response.status})`);
+  }
 
   if (!response.ok) {
     throw new Error(`CDN download failed: ${response.status} ${response.statusText}`);

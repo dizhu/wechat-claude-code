@@ -362,11 +362,14 @@ function createBotMonitor(
     // employees don't clobber each other's files at the cwd level. Done once
     // (guarded by workspaceInitialized) so a later /cwd back to the default is
     // not silently relocated on the next restart.
+    // Deterministic from userId+baseDir; recorded every load so existing
+    // sessions (pre-dating this field) also get a containment root for /cwd.
+    session.workspaceRoot = join(baseDir, shortId(userId));
     if (!session.workspaceInitialized) {
       if (!session.workingDirectory
         || session.workingDirectory === process.cwd()
         || session.workingDirectory === DEFAULT_WORKING_DIR) {
-        session.workingDirectory = join(baseDir, shortId(userId));
+        session.workingDirectory = session.workspaceRoot;
       }
       session.workspaceInitialized = true;
     }
@@ -489,6 +492,9 @@ async function handleMessage(
     const ctx: CommandContext = {
       accountId: sessionKey,
       session,
+      // Owner (the bot's bound WeChat id) may /cwd anywhere on their own machine;
+      // additional authorized users are confined to their workspace root.
+      cwdRoot: fromUserId === account.userId ? undefined : session.workspaceRoot,
       updateSession,
       clearSession: () => {
         const cleared = sessionStore.clear(sessionKey, session);
@@ -757,10 +763,20 @@ async function sendToClaude(
       const cwd = (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir());
       const detectedPaths = extractFilePathsFromText(result.text, cwd);
       const { existsSync } = await import('node:fs');
-      const { extname } = await import('node:path');
+      const { extname, resolve, sep } = await import('node:path');
+      const cwdResolved = resolve(cwd);
+      const dataDirResolved = resolve(DATA_DIR);
       const pushable = detectedPaths.filter(f => {
         const ext = extname(f).toLowerCase();
-        return AUTO_PUSH_EXTENSIONS.has(ext) && existsSync(f);
+        if (!AUTO_PUSH_EXTENSIONS.has(ext) || !existsSync(f)) return false;
+        const fr = resolve(f);
+        // Only auto-push files inside the session's working directory, and never
+        // the daemon's own data/credential store — otherwise merely mentioning a
+        // path (e.g. another bot's account token) would exfiltrate it to whoever
+        // is chatting. The detector matches any absolute path in the response.
+        const inCwd = fr === cwdResolved || fr.startsWith(cwdResolved + sep);
+        const inDataDir = fr === dataDirResolved || fr.startsWith(dataDirResolved + sep);
+        return inCwd && !inDataDir;
       });
       if (pushable.length > 0) {
         const failedFiles: string[] = [];

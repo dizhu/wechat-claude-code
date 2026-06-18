@@ -124,7 +124,14 @@ async function uploadToCdn(url: string, encrypted: Buffer): Promise<string> {
         body: new Uint8Array(encrypted),
         signal: controller.signal,
         headers: { 'Content-Type': 'application/octet-stream' },
+        // Don't follow redirects: the host allowlist only vetted the initial URL.
+        // A 3xx to an attacker host would otherwise re-POST the encrypted bytes there.
+        redirect: 'manual',
       });
+
+      if (res.status >= 300 && res.status < 400) {
+        throw new Error(`CDN 上传被重定向，已拒绝 (status ${res.status})`);
+      }
 
       if (res.status >= 400 && res.status < 500) {
         const text = await res.text();

@@ -2,8 +2,8 @@ import type { CommandContext, CommandResult } from './router.js';
 import { scanAllSkills, formatSkillList, findSkill, type SkillInfo } from '../claude/skill-scanner.js';
 import { loadConfig } from '../config.js';
 import { DEFAULT_WORKING_DIR } from '../constants.js';
-import { readFileSync, existsSync, statSync } from 'node:fs';
-import { resolve, basename, join } from 'node:path';
+import { readFileSync, existsSync, statSync, realpathSync } from 'node:fs';
+import { resolve, basename, join, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
@@ -67,8 +67,34 @@ export function handleCwd(ctx: CommandContext, args: string): CommandResult {
   if (!args) {
     return { reply: `当前工作目录: ${ctx.session.workingDirectory}\n用法: /cwd <路径>`, handled: true };
   }
-  ctx.updateSession({ workingDirectory: args });
-  return { reply: `✅ 工作目录已切换为: ${args}`, handled: true };
+  // Expand a leading ~ and resolve relative paths against the current cwd.
+  const expanded = args.replace(/^~(?=$|\/)/, homedir());
+  const resolved = resolve(ctx.session.workingDirectory, expanded);
+
+  // Must be an existing directory — validate before confirming (mirrors /send;
+  // avoids storing a bad cwd that only fails on the next message).
+  if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
+    return { reply: `❌ 目录不存在或不是文件夹: ${resolved}`, handled: true };
+  }
+
+  // Non-owner users are confined to their workspace root (fail-closed on any
+  // resolution error); the owner (cwdRoot undefined) may switch anywhere.
+  if (ctx.cwdRoot) {
+    try {
+      const root = realpathSync(ctx.cwdRoot);
+      const real = realpathSync(resolved);
+      if (real !== root && !real.startsWith(root + sep)) {
+        return { reply: '❌ 无权切换到工作区以外的目录。', handled: true };
+      }
+      ctx.updateSession({ workingDirectory: real });
+      return { reply: `✅ 工作目录已切换为: ${real}`, handled: true };
+    } catch {
+      return { reply: '❌ 无法校验目录，已拒绝切换。', handled: true };
+    }
+  }
+
+  ctx.updateSession({ workingDirectory: resolved });
+  return { reply: `✅ 工作目录已切换为: ${resolved}`, handled: true };
 }
 
 export function handleModel(ctx: CommandContext, args: string): CommandResult {

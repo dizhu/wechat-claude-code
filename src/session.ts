@@ -23,6 +23,8 @@ export interface Session {
   systemPrompt?: string;
   /** Set once the per-user working directory has been assigned, so it is not re-derived on every restart. */
   workspaceInitialized?: boolean;
+  /** The user's assigned workspace root (baseDir/shortId). Non-owner /cwd is contained within it. */
+  workspaceRoot?: string;
   state: SessionState;
   chatHistory: ChatMessage[];
   maxHistoryLength?: number;

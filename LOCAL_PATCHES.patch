@@ -74,18 +74,60 @@ index fedb7a3..94efb67 100644
  
        if (code !== 0 && code !== null && !textParts.length && !errorMessage) {
 diff --git a/src/commands/handlers.ts b/src/commands/handlers.ts
-index 25586df..b516db7 100644
+index 25586df..f36fead 100644
 --- a/src/commands/handlers.ts
 +++ b/src/commands/handlers.ts
-@@ -1,6 +1,6 @@
+@@ -1,9 +1,9 @@
  import type { CommandContext, CommandResult } from './router.js';
  import { scanAllSkills, formatSkillList, findSkill, type SkillInfo } from '../claude/skill-scanner.js';
 -import { loadConfig, saveConfig } from '../config.js';
 +import { loadConfig } from '../config.js';
  import { DEFAULT_WORKING_DIR } from '../constants.js';
- import { readFileSync, existsSync, statSync } from 'node:fs';
- import { resolve, basename, join } from 'node:path';
-@@ -174,23 +174,23 @@ export function handleVersion(): CommandResult {
+-import { readFileSync, existsSync, statSync } from 'node:fs';
+-import { resolve, basename, join } from 'node:path';
++import { readFileSync, existsSync, statSync, realpathSync } from 'node:fs';
++import { resolve, basename, join, sep } from 'node:path';
+ import { homedir } from 'node:os';
+ import { fileURLToPath } from 'node:url';
+ 
+@@ -67,8 +67,34 @@ export function handleCwd(ctx: CommandContext, args: string): CommandResult {
+   if (!args) {
+     return { reply: `当前工作目录: ${ctx.session.workingDirectory}\n用法: /cwd <路径>`, handled: true };
+   }
+-  ctx.updateSession({ workingDirectory: args });
+-  return { reply: `✅ 工作目录已切换为: ${args}`, handled: true };
++  // Expand a leading ~ and resolve relative paths against the current cwd.
++  const expanded = args.replace(/^~(?=$|\/)/, homedir());
++  const resolved = resolve(ctx.session.workingDirectory, expanded);
++
++  // Must be an existing directory — validate before confirming (mirrors /send;
++  // avoids storing a bad cwd that only fails on the next message).
++  if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
++    return { reply: `❌ 目录不存在或不是文件夹: ${resolved}`, handled: true };
++  }
++
++  // Non-owner users are confined to their workspace root (fail-closed on any
++  // resolution error); the owner (cwdRoot undefined) may switch anywhere.
++  if (ctx.cwdRoot) {
++    try {
++      const root = realpathSync(ctx.cwdRoot);
++      const real = realpathSync(resolved);
++      if (real !== root && !real.startsWith(root + sep)) {
++        return { reply: '❌ 无权切换到工作区以外的目录。', handled: true };
++      }
++      ctx.updateSession({ workingDirectory: real });
++      return { reply: `✅ 工作目录已切换为: ${real}`, handled: true };
++    } catch {
++      return { reply: '❌ 无法校验目录，已拒绝切换。', handled: true };
++    }
++  }
++
++  ctx.updateSession({ workingDirectory: resolved });
++  return { reply: `✅ 工作目录已切换为: ${resolved}`, handled: true };
+ }
+ 
+ export function handleModel(ctx: CommandContext, args: string): CommandResult {
+@@ -174,23 +200,23 @@ export function handleVersion(): CommandResult {
    }
  }
  
@@ -117,6 +159,19 @@ index 25586df..b516db7 100644
  }
  
  export function handleSend(ctx: CommandContext, args: string): CommandResult {
+diff --git a/src/commands/router.ts b/src/commands/router.ts
+index b1446b9..476cacd 100644
+--- a/src/commands/router.ts
++++ b/src/commands/router.ts
+@@ -6,6 +6,8 @@ import { handleHelp, handleClear, handleCwd, handleModel, handleStatus, handleSk
+ export interface CommandContext {
+   accountId: string;
+   session: Session;
++  /** Containment root for /cwd: non-owner users are confined here; undefined = unrestricted (owner). */
++  cwdRoot?: string;
+   updateSession: (partial: Partial<Session>) => void;
+   clearSession: () => Session;
+   getChatHistoryText?: (limit?: number) => string;
 diff --git a/src/config.ts b/src/config.ts
 index 085d33c..1d9f4fd 100644
 --- a/src/config.ts
@@ -161,7 +216,7 @@ index 085d33c..1d9f4fd 100644
    if (process.platform !== "win32") {
      chmodSync(CONFIG_PATH, 0o600);
 diff --git a/src/main.ts b/src/main.ts
-index e0bb69b..89f5a36 100644
+index e0bb69b..7ca6c68 100644
 --- a/src/main.ts
 +++ b/src/main.ts
 @@ -6,7 +6,7 @@ import { unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -182,7 +237,7 @@ index e0bb69b..89f5a36 100644
  import { MessageType, type WeixinMessage } from './wechat/types.js';
  
  // ---------------------------------------------------------------------------
-@@ -239,98 +239,211 @@ async function runSetup(): Promise<void> {
+@@ -239,98 +239,214 @@ async function runSetup(): Promise<void> {
  
  async function runDaemon(): Promise<void> {
    const config = loadConfig();
@@ -341,11 +396,14 @@ index e0bb69b..89f5a36 100644
 +    // employees don't clobber each other's files at the cwd level. Done once
 +    // (guarded by workspaceInitialized) so a later /cwd back to the default is
 +    // not silently relocated on the next restart.
++    // Deterministic from userId+baseDir; recorded every load so existing
++    // sessions (pre-dating this field) also get a containment root for /cwd.
++    session.workspaceRoot = join(baseDir, shortId(userId));
 +    if (!session.workspaceInitialized) {
 +      if (!session.workingDirectory
 +        || session.workingDirectory === process.cwd()
 +        || session.workingDirectory === DEFAULT_WORKING_DIR) {
-+        session.workingDirectory = join(baseDir, shortId(userId));
++        session.workingDirectory = session.workspaceRoot;
 +      }
 +      session.workspaceInitialized = true;
 +    }
@@ -454,7 +512,7 @@ index e0bb69b..89f5a36 100644
  }
  
  // ---------------------------------------------------------------------------
-@@ -340,22 +453,20 @@ async function runDaemon(): Promise<void> {
+@@ -340,22 +456,20 @@ async function runDaemon(): Promise<void> {
  async function handleMessage(
    msg: WeixinMessage,
    account: AccountData,
@@ -480,7 +538,7 @@ index e0bb69b..89f5a36 100644
  
    // Extract text from items
    const userText = extractTextFromItems(msg.item_list);
-@@ -372,14 +483,18 @@ async function handleMessage(
+@@ -372,14 +486,21 @@ async function handleMessage(
    if (userText.startsWith('/')) {
      const updateSession = (partial: Partial<Session>) => {
        Object.assign(session, partial);
@@ -492,6 +550,9 @@ index e0bb69b..89f5a36 100644
 -      accountId: account.accountId,
 +      accountId: sessionKey,
        session,
++      // Owner (the bot's bound WeChat id) may /cwd anywhere on their own machine;
++      // additional authorized users are confined to their workspace root.
++      cwdRoot: fromUserId === account.userId ? undefined : session.workspaceRoot,
        updateSession,
 -      clearSession: () => sessionStore.clear(account.accountId),
 +      clearSession: () => {
@@ -502,7 +563,7 @@ index e0bb69b..89f5a36 100644
        getChatHistoryText: (limit?: number) => sessionStore.getChatHistoryText(session, limit),
        text: userText,
      };
-@@ -394,7 +509,7 @@ async function handleMessage(
+@@ -394,7 +515,7 @@ async function handleMessage(
      if (result.handled && result.claudePrompt) {
        await sendToClaude(
          result.claudePrompt, imageItem, fileItem, fromUserId, contextToken,
@@ -511,7 +572,7 @@ index e0bb69b..89f5a36 100644
        );
        return;
      }
-@@ -418,7 +533,7 @@ async function handleMessage(
+@@ -418,7 +539,7 @@ async function handleMessage(
  
    await sendToClaude(
      userText, imageItem, fileItem, fromUserId, contextToken,
@@ -520,7 +581,7 @@ index e0bb69b..89f5a36 100644
    );
  }
  
-@@ -433,6 +548,7 @@ async function sendToClaude(
+@@ -433,6 +554,7 @@ async function sendToClaude(
    fromUserId: string,
    contextToken: string,
    account: AccountData,
@@ -528,7 +589,7 @@ index e0bb69b..89f5a36 100644
    session: Session,
    sessionStore: ReturnType<typeof createSessionStore>,
    sender: ReturnType<typeof createSender>,
-@@ -441,11 +557,11 @@ async function sendToClaude(
+@@ -441,11 +563,11 @@ async function sendToClaude(
  ): Promise<void> {
    // Set state to processing
    session.state = 'processing';
@@ -542,7 +603,7 @@ index e0bb69b..89f5a36 100644
  
    // Flush timer for streaming text to WeChat during query (declared here for finally cleanup)
    let flushTimer: ReturnType<typeof setInterval> | undefined;
-@@ -555,7 +671,7 @@ async function sendToClaude(
+@@ -555,7 +677,7 @@ async function sendToClaude(
        model: session.model,
        systemPrompt: [
          '你正在通过微信与用户对话，不是在终端里。不要让用户去终端操作。如果用户需要文件，直接输出文件地址就行，会自动识别解析推送文件到用户的微信中。',
@@ -551,7 +612,7 @@ index e0bb69b..89f5a36 100644
        ].filter(Boolean).join('\n'),
        abortController,
        images,
-@@ -580,14 +696,27 @@ async function sendToClaude(
+@@ -580,14 +702,27 @@ async function sendToClaude(
  
      let result = await claudeQuery(queryOptions);
  
@@ -580,7 +641,7 @@ index e0bb69b..89f5a36 100644
      }
  
      // Stop periodic flush and send any remaining buffered content
-@@ -609,7 +738,11 @@ async function sendToClaude(
+@@ -609,7 +744,11 @@ async function sendToClaude(
        }
      } else if (result.error) {
        logger.error('Claude query error', { error: result.error });
@@ -593,7 +654,7 @@ index e0bb69b..89f5a36 100644
      } else if (!anySent) {
        await sender.sendText(fromUserId, contextToken, 'Claude 无返回内容（可能因权限被拒而终止）');
      }
-@@ -617,7 +750,7 @@ async function sendToClaude(
+@@ -617,17 +756,27 @@ async function sendToClaude(
      // Update session with new SDK session ID
      session.sdkSessionId = result.sessionId || undefined;
      session.state = 'idle';
@@ -602,7 +663,29 @@ index e0bb69b..89f5a36 100644
  
      // Auto-push deliverable files mentioned in Claude's response
      if (result.text) {
-@@ -674,13 +807,13 @@ async function sendToClaude(
+       const cwd = (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir());
+       const detectedPaths = extractFilePathsFromText(result.text, cwd);
+       const { existsSync } = await import('node:fs');
+-      const { extname } = await import('node:path');
++      const { extname, resolve, sep } = await import('node:path');
++      const cwdResolved = resolve(cwd);
++      const dataDirResolved = resolve(DATA_DIR);
+       const pushable = detectedPaths.filter(f => {
+         const ext = extname(f).toLowerCase();
+-        return AUTO_PUSH_EXTENSIONS.has(ext) && existsSync(f);
++        if (!AUTO_PUSH_EXTENSIONS.has(ext) || !existsSync(f)) return false;
++        const fr = resolve(f);
++        // Only auto-push files inside the session's working directory, and never
++        // the daemon's own data/credential store — otherwise merely mentioning a
++        // path (e.g. another bot's account token) would exfiltrate it to whoever
++        // is chatting. The detector matches any absolute path in the response.
++        const inCwd = fr === cwdResolved || fr.startsWith(cwdResolved + sep);
++        const inDataDir = fr === dataDirResolved || fr.startsWith(dataDirResolved + sep);
++        return inCwd && !inDataDir;
+       });
+       if (pushable.length > 0) {
+         const failedFiles: string[] = [];
+@@ -674,13 +823,13 @@ async function sendToClaude(
        await sender.sendText(fromUserId, contextToken, '处理消息时出错，请稍后重试。');
      }
      session.state = 'idle';
@@ -620,10 +703,10 @@ index e0bb69b..89f5a36 100644
    }
  }
 diff --git a/src/session.ts b/src/session.ts
-index 77776b2..c62a566 100644
+index 77776b2..a21d7c8 100644
 --- a/src/session.ts
 +++ b/src/session.ts
-@@ -19,6 +19,10 @@ export interface Session {
+@@ -19,6 +19,12 @@ export interface Session {
    previousSdkSessionId?: string;
    workingDirectory: string;
    model?: string;
@@ -631,10 +714,12 @@ index 77776b2..c62a566 100644
 +  systemPrompt?: string;
 +  /** Set once the per-user working directory has been assigned, so it is not re-derived on every restart. */
 +  workspaceInitialized?: boolean;
++  /** The user's assigned workspace root (baseDir/shortId). Non-owner /cwd is contained within it. */
++  workspaceRoot?: string;
    state: SessionState;
    chatHistory: ChatMessage[];
    maxHistoryLength?: number;
-@@ -70,6 +74,8 @@ export function createSessionStore() {
+@@ -70,6 +76,8 @@ export function createSessionStore() {
        previousSdkSessionId: undefined,
        workingDirectory: currentSession?.workingDirectory ?? DEFAULT_WORKING_DIR,
        model: currentSession?.model,
@@ -721,6 +806,31 @@ index 0b9444d..c4df7fc 100644
      }
      this.token = token;
      this.baseUrl = baseUrl.replace(/\/+$/, '');
+diff --git a/src/wechat/cdn.ts b/src/wechat/cdn.ts
+index da9a22b..417c6f6 100644
+--- a/src/wechat/cdn.ts
++++ b/src/wechat/cdn.ts
+@@ -18,13 +18,19 @@ export async function downloadAndDecrypt(
+   const timer = setTimeout(() => controller.abort(), 30_000);
+   let response: Response;
+   try {
+-    response = await fetch(url, { signal: controller.signal });
++    // Don't follow redirects: the download host is the fixed trusted CDN base;
++    // a 3xx could steer the fetch to an untrusted host.
++    response = await fetch(url, { signal: controller.signal, redirect: 'manual' });
+   } catch (err) {
+     clearTimeout(timer);
+     throw new Error(`CDN download failed: ${err instanceof Error ? err.message : String(err)}`);
+   }
+   clearTimeout(timer);
+ 
++  if (response.status >= 300 && response.status < 400) {
++    throw new Error(`CDN download redirected, refused (status ${response.status})`);
++  }
++
+   if (!response.ok) {
+     throw new Error(`CDN download failed: ${response.status} ${response.statusText}`);
+   }
 diff --git a/src/wechat/media.ts b/src/wechat/media.ts
 index f8e66e7..e841cca 100644
 --- a/src/wechat/media.ts
@@ -844,7 +954,7 @@ index 5bd3c16..c33c503 100644
    get_updates_buf: string;
    msgs?: WeixinMessage[];
 diff --git a/src/wechat/upload.ts b/src/wechat/upload.ts
-index 8ff88d3..d1f6817 100644
+index 8ff88d3..1781946 100644
 --- a/src/wechat/upload.ts
 +++ b/src/wechat/upload.ts
 @@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
@@ -888,3 +998,19 @@ index 8ff88d3..d1f6817 100644
      uploadUrl = uploadResp.upload_full_url;
    } else {
      uploadUrl = `${CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(uploadResp.upload_param!)}&filekey=${fileKey}`;
+@@ -112,8 +124,15 @@ async function uploadToCdn(url: string, encrypted: Buffer): Promise<string> {
+         body: new Uint8Array(encrypted),
+         signal: controller.signal,
+         headers: { 'Content-Type': 'application/octet-stream' },
++        // Don't follow redirects: the host allowlist only vetted the initial URL.
++        // A 3xx to an attacker host would otherwise re-POST the encrypted bytes there.
++        redirect: 'manual',
+       });
+ 
++      if (res.status >= 300 && res.status < 400) {
++        throw new Error(`CDN 上传被重定向，已拒绝 (status ${res.status})`);
++      }
++
+       if (res.status >= 400 && res.status < 500) {
+         const text = await res.text();
+         throw new Error(`CDN 上传失败 (4xx): ${res.status} ${text.slice(0, 200)}`);

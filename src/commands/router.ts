@@ -6,6 +6,8 @@ import { handleHelp, handleClear, handleCwd, handleModel, handleStatus, handleSk
 export interface CommandContext {
   accountId: string;
   session: Session;
+  /** Containment root for /cwd: non-owner users are confined here; undefined = unrestricted (owner). */
+  cwdRoot?: string;
   updateSession: (partial: Partial<Session>) => void;
   clearSession: () => Session;
   getChatHistoryText?: (limit?: number) => string;

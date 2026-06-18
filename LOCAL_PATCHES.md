@@ -145,3 +145,17 @@ API 被 MITM/劫持时，加密文件会被上传到攻击者主机。
 涉及文件：`src/wechat/monitor.ts`、`src/wechat/types.ts`
 
 1. **【重要】session timeout 不退避导致热循环轰炸接口**（`monitor.ts` + `types.ts`）：`getupdates` 出错时服务端返回的是 `errcode`/`errmsg`（如 session 超时 `errcode:-14`），而轮询循环只判断 `resp.ret`。字段名对不上 → `ret` 为 `undefined` → 既不触发「过期暂停 1 小时」、也不进异常退避分支 → 循环立刻空转，实测约 **20 次/秒**无延迟轰炸 ilink 接口（实跑 500 行日志里 166 次 -14）。在「一个微信号同一时刻只有一个活 session」的现实下，任一 bot 掉线（被另一台机器或新扫码顶下线）就会触发此热循环，正是反外挂封号的高危行为。**修复**：① `GetUpdatesResp` 类型补上 `errcode`/`errmsg`；② monitor 用 `code = resp.ret ?? resp.errcode` 归一化，-14 走暂停分支，其余非 0 错误码打日志后 `BACKOFF_SHORT_MS`(3s) 退避再继续，不再空转。**已编译验证**。
+
+---
+
+## 第七批：深度 review 的 3 项修复（2026-06-19，编译验证 ✅）
+
+一次全 `src/` 深度安全审查后，挑出 3 个跨真实信任边界、修复成本低的项落地（其余发现见 review 报告，多为纵深防御/离线工具）。
+
+涉及文件：`src/main.ts`、`src/session.ts`、`src/commands/router.ts`、`src/commands/handlers.ts`、`src/wechat/upload.ts`、`src/wechat/cdn.ts`
+
+1. **【高】自动推送文件不受工作目录约束 → 可外泄凭证**（`main.ts`）：每轮回复后 `extractFilePathsFromText` 从 Claude 文本里抓绝对路径，`pushable` 过滤只看扩展名 + `existsSync`，**完全不限 cwd**（`cwd` 参数传入却没用）。一句「看下 `~/.wechat-claude-code/accounts/<另一bot>.json`」即可让守护进程把另一 bot 的 `botToken` 自动推给当前聊天对象，打穿多 bot 隔离。**修复**：`pushable` 增加包含性断言——仅推送解析后落在本会话 cwd 内、且不在 `DATA_DIR`(`~/.wechat-claude-code`) 内的文件。**行为变化**：Claude 写到 cwd 之外（如 `/tmp`）的文件不再自动推送。
+
+2. **【中】`/cwd` 零校验、无包含性 → 打破每用户工作区隔离**（`handlers.ts` + `session.ts` + `router.ts` + `main.ts`）：原 `handleCwd` 把输入原样存为 `workingDirectory`，不验存在/是否目录、不限范围，且先回「✅ 已切换」再说。**修复**：① `handleCwd` 展开 `~`→`resolve`→`existsSync`+`isDirectory()` 校验（对齐 `/send`），失败拒绝；② 引入「owner 自由、非 owner 受限」模型——`Session.workspaceRoot` 在 `getRuntime` 确定性记录，`CommandContext.cwdRoot` 仅对非 owner（不在 `account.userId`）置为工作区根，`handleCwd` 对非 owner 做 `realpathSync` 包含校验、越界拒绝、异常 fail-closed。owner（绑定本人）仍可 `/cwd` 到本机任意目录，不影响主用法。
+
+3. **【中】上传/下载跟随 HTTP 重定向 → 白名单可被绕过(SSRF)**（`upload.ts` + `cdn.ts`）：`upload_full_url` 经 `isTrustedWechatUrl` 校验后交给 `fetch`，但默认 `redirect:'follow'`——一个合法 `*.weixin.qq.com` 地址再 302 跳到攻击者主机即可让加密字节被 re-POST 出去，使第 4 批上传白名单形同虚设。**修复**：上传与下载 `fetch` 均加 `redirect:'manual'`，遇 3xx 直接拒绝报错。
