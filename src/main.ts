@@ -762,20 +762,24 @@ async function sendToClaude(
     if (result.text) {
       const cwd = (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir());
       const detectedPaths = extractFilePathsFromText(result.text, cwd);
-      const { existsSync } = await import('node:fs');
+      const { existsSync, realpathSync } = await import('node:fs');
       const { extname, resolve, sep } = await import('node:path');
-      const cwdResolved = resolve(cwd);
-      const dataDirResolved = resolve(DATA_DIR);
+      // Canonicalize (resolve symlinks) on both sides so the prefix compare is
+      // consistent — non-owner cwd is stored as a realpath, and macOS dirs like
+      // /tmp are symlinks, so a plain resolve() would mismatch and drop files.
+      const canon = (p: string): string => { try { return realpathSync(p); } catch { return resolve(p); } };
+      const cwdReal = canon(cwd);
+      const dataDirReal = canon(DATA_DIR);
       const pushable = detectedPaths.filter(f => {
         const ext = extname(f).toLowerCase();
         if (!AUTO_PUSH_EXTENSIONS.has(ext) || !existsSync(f)) return false;
-        const fr = resolve(f);
+        const fr = canon(f);
         // Only auto-push files inside the session's working directory, and never
         // the daemon's own data/credential store — otherwise merely mentioning a
         // path (e.g. another bot's account token) would exfiltrate it to whoever
         // is chatting. The detector matches any absolute path in the response.
-        const inCwd = fr === cwdResolved || fr.startsWith(cwdResolved + sep);
-        const inDataDir = fr === dataDirResolved || fr.startsWith(dataDirResolved + sep);
+        const inCwd = fr === cwdReal || fr.startsWith(cwdReal + sep);
+        const inDataDir = fr === dataDirReal || fr.startsWith(dataDirReal + sep);
         return inCwd && !inDataDir;
       });
       if (pushable.length > 0) {

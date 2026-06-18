@@ -40,11 +40,13 @@ export function redact(obj: unknown): string {
     /"([^"]*?(?:token|secret|password|api[-_]?key|aes[-_]?key|encodingaeskey|credential|authorization|signature)[^"]*?)"\s*:\s*"[^"]*"/gi,
     (_match, key: string) => `"${key}": "***"`,
   );
-  // Mask credentials embedded in URLs (userinfo form: scheme://user:pass@host)
-  safe = safe.replace(/([a-z][a-z0-9+.\-]*:\/\/)[^/@\s":]+:[^/@\s":]+@/gi, "$1***:***@");
-  // Mask sensitive query-string parameters (?token=…, &key=…, …)
+  // Mask credentials embedded in URLs (userinfo form: scheme://user:pass@host).
+  // Single bounded character class (no nested unbounded quantifiers) so a long
+  // URL-like value without an '@' can't trigger catastrophic backtracking.
+  safe = safe.replace(/([a-z][a-z0-9+.\-]{0,32}:\/\/)[^/@\s"]{1,256}@/gi, "$1***@");
+  // Mask sensitive query-string parameters (?token=…, &key=…, …); bounded classes.
   safe = safe.replace(
-    /([?&][^=&\s"]*(?:token|secret|key|password|signature)[^=&\s"]*=)[^&\s"]+/gi,
+    /([?&][^=&\s"]{0,64}(?:token|secret|key|password|signature)[^=&\s"]{0,64}=)[^&\s"]{1,512}/gi,
     "$1***",
   );
   return safe;

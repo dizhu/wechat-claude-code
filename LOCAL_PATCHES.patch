@@ -216,10 +216,10 @@ index 085d33c..1d9f4fd 100644
    if (process.platform !== "win32") {
      chmodSync(CONFIG_PATH, 0o600);
 diff --git a/src/logger.ts b/src/logger.ts
-index 90ba24b..9cdaff4 100644
+index 90ba24b..de4001f 100644
 --- a/src/logger.ts
 +++ b/src/logger.ts
-@@ -32,20 +32,27 @@ export function redact(obj: unknown): string {
+@@ -32,20 +32,29 @@ export function redact(obj: unknown): string {
    let safe = raw;
    // Mask Bearer tokens: "Bearer <anything>"
    safe = safe.replace(/Bearer\s+[^\s"\\]+/gi, "Bearer ***");
@@ -238,11 +238,13 @@ index 90ba24b..9cdaff4 100644
 +    /"([^"]*?(?:token|secret|password|api[-_]?key|aes[-_]?key|encodingaeskey|credential|authorization|signature)[^"]*?)"\s*:\s*"[^"]*"/gi,
 +    (_match, key: string) => `"${key}": "***"`,
 +  );
-+  // Mask credentials embedded in URLs (userinfo form: scheme://user:pass@host)
-+  safe = safe.replace(/([a-z][a-z0-9+.\-]*:\/\/)[^/@\s":]+:[^/@\s":]+@/gi, "$1***:***@");
-+  // Mask sensitive query-string parameters (?token=…, &key=…, …)
++  // Mask credentials embedded in URLs (userinfo form: scheme://user:pass@host).
++  // Single bounded character class (no nested unbounded quantifiers) so a long
++  // URL-like value without an '@' can't trigger catastrophic backtracking.
++  safe = safe.replace(/([a-z][a-z0-9+.\-]{0,32}:\/\/)[^/@\s"]{1,256}@/gi, "$1***@");
++  // Mask sensitive query-string parameters (?token=…, &key=…, …); bounded classes.
 +  safe = safe.replace(
-+    /([?&][^=&\s"]*(?:token|secret|key|password|signature)[^=&\s"]*=)[^&\s"]+/gi,
++    /([?&][^=&\s"]{0,64}(?:token|secret|key|password|signature)[^=&\s"]{0,64}=)[^&\s"]{1,512}/gi,
 +    "$1***",
    );
    return safe;
@@ -255,7 +257,7 @@ index 90ba24b..9cdaff4 100644
    cleanupOldLogs();
  }
  
-@@ -64,7 +71,8 @@ function writeLogLine(level: string, message: string, data?: unknown): void {
+@@ -64,7 +73,8 @@ function writeLogLine(level: string, message: string, data?: unknown): void {
      parts.push(redact(data));
    }
    const line = parts.join(" ") + "\n";
@@ -266,7 +268,7 @@ index 90ba24b..9cdaff4 100644
  
  export const logger = {
 diff --git a/src/main.ts b/src/main.ts
-index e0bb69b..7ca6c68 100644
+index e0bb69b..0fb6405 100644
 --- a/src/main.ts
 +++ b/src/main.ts
 @@ -6,7 +6,7 @@ import { unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -704,7 +706,7 @@ index e0bb69b..7ca6c68 100644
      } else if (!anySent) {
        await sender.sendText(fromUserId, contextToken, 'Claude 无返回内容（可能因权限被拒而终止）');
      }
-@@ -617,17 +756,27 @@ async function sendToClaude(
+@@ -617,17 +756,31 @@ async function sendToClaude(
      // Update session with new SDK session ID
      session.sdkSessionId = result.sessionId || undefined;
      session.state = 'idle';
@@ -715,27 +717,32 @@ index e0bb69b..7ca6c68 100644
      if (result.text) {
        const cwd = (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir());
        const detectedPaths = extractFilePathsFromText(result.text, cwd);
-       const { existsSync } = await import('node:fs');
+-      const { existsSync } = await import('node:fs');
 -      const { extname } = await import('node:path');
++      const { existsSync, realpathSync } = await import('node:fs');
 +      const { extname, resolve, sep } = await import('node:path');
-+      const cwdResolved = resolve(cwd);
-+      const dataDirResolved = resolve(DATA_DIR);
++      // Canonicalize (resolve symlinks) on both sides so the prefix compare is
++      // consistent — non-owner cwd is stored as a realpath, and macOS dirs like
++      // /tmp are symlinks, so a plain resolve() would mismatch and drop files.
++      const canon = (p: string): string => { try { return realpathSync(p); } catch { return resolve(p); } };
++      const cwdReal = canon(cwd);
++      const dataDirReal = canon(DATA_DIR);
        const pushable = detectedPaths.filter(f => {
          const ext = extname(f).toLowerCase();
 -        return AUTO_PUSH_EXTENSIONS.has(ext) && existsSync(f);
 +        if (!AUTO_PUSH_EXTENSIONS.has(ext) || !existsSync(f)) return false;
-+        const fr = resolve(f);
++        const fr = canon(f);
 +        // Only auto-push files inside the session's working directory, and never
 +        // the daemon's own data/credential store — otherwise merely mentioning a
 +        // path (e.g. another bot's account token) would exfiltrate it to whoever
 +        // is chatting. The detector matches any absolute path in the response.
-+        const inCwd = fr === cwdResolved || fr.startsWith(cwdResolved + sep);
-+        const inDataDir = fr === dataDirResolved || fr.startsWith(dataDirResolved + sep);
++        const inCwd = fr === cwdReal || fr.startsWith(cwdReal + sep);
++        const inDataDir = fr === dataDirReal || fr.startsWith(dataDirReal + sep);
 +        return inCwd && !inDataDir;
        });
        if (pushable.length > 0) {
          const failedFiles: string[] = [];
-@@ -674,13 +823,13 @@ async function sendToClaude(
+@@ -674,13 +827,13 @@ async function sendToClaude(
        await sender.sendText(fromUserId, contextToken, '处理消息时出错，请稍后重试。');
      }
      session.state = 'idle';

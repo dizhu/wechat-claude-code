@@ -173,3 +173,16 @@ API 被 MITM/劫持时，加密文件会被上传到攻击者主机。
 3. **【低】`redact()` key 白名单有缺口**（`logger.ts`）：漏连字符 key(`x-api-key`)、无下划线的 `aeskey`/`EncodingAESKey`、URL 内嵌凭证。**修复**：key 匹配改为「含敏感子串(token/secret/password/api[-_]?key/aes[-_]?key/encodingaeskey/credential/authorization/signature)」即遮蔽；新增 URL userinfo(`user:pass@`)与敏感查询参数遮蔽。**已用例验证**：`botToken`/`context_token`/`EncodingAESKey`/`x-api-key`/`aeskey`/URL 凭证均遮蔽，`design`/`model`/`workingDirectory` 不误伤。
 4. **【低】日志目录/文件权限过宽**（`logger.ts`）：原默认 0644/全局可读，与凭证文件的 0600 不一致。**修复**：`mkdirSync(LOG_DIR,{mode:0o700})`，新日志文件 `appendFileSync(..,{mode:0o600})`。
 5. **【低】可视化输出 HTML 权限过宽**（`visualize-logs.ts`）：报告含完整对话。**修复**：`writeFileSync(output, html, {mode:0o600})`。
+
+---
+
+## 第九批：对第七/八批的 final review 修复（2026-06-19，编译+计时验证 ✅）
+
+对第七、八批做对抗式复审，发现 2 个由本轮修复**引入**的真问题并修复（M2 重定向修复经实测确认正确、无需改）。
+
+涉及文件：`src/logger.ts`、`src/main.ts`
+
+1. **【严重】第八批 redact 的 URL-userinfo 正则有 ReDoS**（`logger.ts`）：`[^/@\s":]+:[^/@\s":]+@` 嵌套两个无界 `+`，遇「长 URL 但无 `@`」输入灾难性回溯——实测 4 万字符 2.7s、20 万字符 66s。授权用户发个长串即可卡死事件循环（本轮自伤）。**修复**：改为单一有界字符类 `([a-z][a-z0-9+.\-]{0,32}:\/\/)[^/@\s"]{1,256}@` → `$1***@`，查询参数正则的字符类也加 `{0,64}`/`{1,512}` 上界。**计时复测**：40k/200k/500k 字符分别 5.6/26.6/65.6ms（线性）；遮蔽正确性不变。
+2. **【中】第七批 auto-push 包含性比对在符号链接下漏推**（`main.ts`）：非 owner 的 `/cwd` 存的是 `realpathSync` 路径，而 auto-push 用 `resolve` 比对；macOS `/tmp`→`/private/tmp` 等符号链接下两边不一致 → Claude 生成的合法文件被漏推。**修复**：auto-push 对 cwd / DATA_DIR / 每个候选文件统一用 `realpathSync` 规范化（失败回退 `resolve`）后再做前缀比对，两侧一致。
+
+**复审确认无误的**：M2 `redirect:'manual'` 在 Node v25(undici 服务端) 返回真实 302 状态、`type:'basic'`、`ok:false` 且不跟随（浏览器才是 `status:0` opaqueredirect），故 `status>=300&&<400` 判断有效；`handleCwd` 的 `~` 展开/绝对相对解析/owner 不受 fail-closed 影响/owner 身份取自 `account.userId` 均正确；`workspaceRoot` 每次 load 确定性重写、不受陈旧值影响。redact 对裸 `key`(如键名就叫 `key`)仍不遮蔽，属可接受的轻微欠遮蔽（避免误伤 `monkey` 等）。
