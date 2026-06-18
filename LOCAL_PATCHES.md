@@ -159,3 +159,17 @@ API 被 MITM/劫持时，加密文件会被上传到攻击者主机。
 2. **【中】`/cwd` 零校验、无包含性 → 打破每用户工作区隔离**（`handlers.ts` + `session.ts` + `router.ts` + `main.ts`）：原 `handleCwd` 把输入原样存为 `workingDirectory`，不验存在/是否目录、不限范围，且先回「✅ 已切换」再说。**修复**：① `handleCwd` 展开 `~`→`resolve`→`existsSync`+`isDirectory()` 校验（对齐 `/send`），失败拒绝；② 引入「owner 自由、非 owner 受限」模型——`Session.workspaceRoot` 在 `getRuntime` 确定性记录，`CommandContext.cwdRoot` 仅对非 owner（不在 `account.userId`）置为工作区根，`handleCwd` 对非 owner 做 `realpathSync` 包含校验、越界拒绝、异常 fail-closed。owner（绑定本人）仍可 `/cwd` 到本机任意目录，不影响主用法。
 
 3. **【中】上传/下载跟随 HTTP 重定向 → 白名单可被绕过(SSRF)**（`upload.ts` + `cdn.ts`）：`upload_full_url` 经 `isTrustedWechatUrl` 校验后交给 `fetch`，但默认 `redirect:'follow'`——一个合法 `*.weixin.qq.com` 地址再 302 跳到攻击者主机即可让加密字节被 re-POST 出去，使第 4 批上传白名单形同虚设。**修复**：上传与下载 `fetch` 均加 `redirect:'manual'`，遇 3xx 直接拒绝报错。
+
+---
+
+## 第八批：日志与离线工具的密钥暴露面（2026-06-19，编译+运行验证 ✅）
+
+承接第七批 review，清掉日志/离线工具一类的密钥暴露与注入面。
+
+涉及文件：`src/wechat/api.ts`、`src/logger.ts`、`src/tools/visualize-logs.ts`
+
+1. **【中】API 请求/响应体明文落盘（含对话全文）**（`api.ts`）：`request()` 在 debug 级整体打印 `body` 与响应 `json`；`redact()` 按 key 名遮蔽，够不到 `sendmessage` 的对话文本、文件名、游标。**修复**：默认只打摘要（请求只记 `url`；响应经 `summarizeResp` 仅留 `ret/errcode/retmsg/errmsg/msgCount/hasBuf`），需要完整 dump 时设 `WCC_LOG_FULL_BODY=1`。
+2. **【中】`visualize-logs.ts` `execSync(\`open "${output}"\`)` 命令注入**：`--output` 含 `"` 的文件名可逃逸 shell。**修复**：改 `execFileSync('open', [output])`，无 shell。
+3. **【低】`redact()` key 白名单有缺口**（`logger.ts`）：漏连字符 key(`x-api-key`)、无下划线的 `aeskey`/`EncodingAESKey`、URL 内嵌凭证。**修复**：key 匹配改为「含敏感子串(token/secret/password/api[-_]?key/aes[-_]?key/encodingaeskey/credential/authorization/signature)」即遮蔽；新增 URL userinfo(`user:pass@`)与敏感查询参数遮蔽。**已用例验证**：`botToken`/`context_token`/`EncodingAESKey`/`x-api-key`/`aeskey`/URL 凭证均遮蔽，`design`/`model`/`workingDirectory` 不误伤。
+4. **【低】日志目录/文件权限过宽**（`logger.ts`）：原默认 0644/全局可读，与凭证文件的 0600 不一致。**修复**：`mkdirSync(LOG_DIR,{mode:0o700})`，新日志文件 `appendFileSync(..,{mode:0o600})`。
+5. **【低】可视化输出 HTML 权限过宽**（`visualize-logs.ts`）：报告含完整对话。**修复**：`writeFileSync(output, html, {mode:0o600})`。

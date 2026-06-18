@@ -215,6 +215,56 @@ index 085d33c..1d9f4fd 100644
    writeFileSync(CONFIG_PATH, JSON.stringify(data, null, 2) + "\n", "utf-8");
    if (process.platform !== "win32") {
      chmodSync(CONFIG_PATH, 0o600);
+diff --git a/src/logger.ts b/src/logger.ts
+index 90ba24b..9cdaff4 100644
+--- a/src/logger.ts
++++ b/src/logger.ts
+@@ -32,20 +32,27 @@ export function redact(obj: unknown): string {
+   let safe = raw;
+   // Mask Bearer tokens: "Bearer <anything>"
+   safe = safe.replace(/Bearer\s+[^\s"\\]+/gi, "Bearer ***");
+-  // Mask generic token/secret/password/api_key values in JSON
+-  // Matches both snake_case (bot_token) and camelCase (botToken)
++  // Mask sensitive JSON string values by key name. Matches snake_case,
++  // camelCase and kebab-case keys whose name contains a sensitive substring
++  // (token, secret, password, api[-_]?key, aes[-_]?key, EncodingAESKey,
++  // credential, authorization, signature).
+   safe = safe.replace(
+-    /"(?:(?:[\w]+_)?[Tt]oken|(?:[\w]+_)?[Ss]ecret|(?:[\w]+_)?[Pp]assword|(?:[\w]+_)?api_key|[Aa]es_[Kk]ey)"\s*:\s*"[^"]*"/gi,
+-    (match) => {
+-      const key = match.match(/"[^"]*"/)?.[0] ?? '""';
+-      return `${key}: "***"`;
+-    },
++    /"([^"]*?(?:token|secret|password|api[-_]?key|aes[-_]?key|encodingaeskey|credential|authorization|signature)[^"]*?)"\s*:\s*"[^"]*"/gi,
++    (_match, key: string) => `"${key}": "***"`,
++  );
++  // Mask credentials embedded in URLs (userinfo form: scheme://user:pass@host)
++  safe = safe.replace(/([a-z][a-z0-9+.\-]*:\/\/)[^/@\s":]+:[^/@\s":]+@/gi, "$1***:***@");
++  // Mask sensitive query-string parameters (?token=…, &key=…, …)
++  safe = safe.replace(
++    /([?&][^=&\s"]*(?:token|secret|key|password|signature)[^=&\s"]*=)[^&\s"]+/gi,
++    "$1***",
+   );
+   return safe;
+ }
+ 
+ function ensureLogDir(): void {
+-  mkdirSync(LOG_DIR, { recursive: true });
++  // Logs contain conversation contents — keep dir/files owner-only (like creds).
++  mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 });
+   cleanupOldLogs();
+ }
+ 
+@@ -64,7 +71,8 @@ function writeLogLine(level: string, message: string, data?: unknown): void {
+     parts.push(redact(data));
+   }
+   const line = parts.join(" ") + "\n";
+-  appendFileSync(getLogFilePath(), line, "utf-8");
++  // mode applies only on file creation; new log files are owner-only (0600).
++  appendFileSync(getLogFilePath(), line, { encoding: "utf-8", mode: 0o600 });
+ }
+ 
+ export const logger = {
 diff --git a/src/main.ts b/src/main.ts
 index e0bb69b..7ca6c68 100644
 --- a/src/main.ts
@@ -728,6 +778,34 @@ index 77776b2..a21d7c8 100644
        state: 'idle',
        chatHistory: [],
        maxHistoryLength: currentSession?.maxHistoryLength || DEFAULT_MAX_HISTORY,
+diff --git a/src/tools/visualize-logs.ts b/src/tools/visualize-logs.ts
+index 33b952c..9f80469 100644
+--- a/src/tools/visualize-logs.ts
++++ b/src/tools/visualize-logs.ts
+@@ -12,7 +12,7 @@
+ import { readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs';
+ import { join } from 'node:path';
+ import { homedir } from 'node:os';
+-import { execSync } from 'node:child_process';
++import { execFileSync } from 'node:child_process';
+ 
+ const DATA_DIR = process.env.WCC_DATA_DIR || join(homedir(), '.wechat-claude-code');
+ 
+@@ -718,10 +718,12 @@ function main() {
+   const html = generateHtml(sessions, date);
+ 
+   if (output) {
+-    writeFileSync(output, html, 'utf-8');
++    // Report contains full conversation transcripts — owner-only.
++    writeFileSync(output, html, { encoding: 'utf-8', mode: 0o600 });
+     console.log(`Written to: ${output}`);
+     if (open) {
+-      execSync(`open "${output}"`);
++      // execFile (no shell): a filename with shell metacharacters can't inject.
++      execFileSync('open', [output]);
+     }
+   } else {
+     process.stdout.write(html);
 diff --git a/src/wechat/accounts.ts b/src/wechat/accounts.ts
 index aa057a8..f665663 100644
 --- a/src/wechat/accounts.ts
@@ -756,13 +834,31 @@ index aa057a8..f665663 100644
 +  }
 +}
 diff --git a/src/wechat/api.ts b/src/wechat/api.ts
-index 0b9444d..c4df7fc 100644
+index 0b9444d..79cc5ff 100644
 --- a/src/wechat/api.ts
 +++ b/src/wechat/api.ts
-@@ -14,6 +14,23 @@ function generateUin(): string {
+@@ -14,6 +14,41 @@ function generateUin(): string {
    return Buffer.from(buf).toString('base64');
  }
  
++// Full request/response bodies carry conversation text, file names and cursors
++// that the key-name redactor does not mask. Log only a summary by default;
++// set WCC_LOG_FULL_BODY=1 to dump everything when debugging.
++const LOG_FULL_BODY = process.env.WCC_LOG_FULL_BODY === '1';
++
++/** Summarize an API response for logging without dumping message contents. */
++function summarizeResp(json: unknown): Record<string, unknown> {
++  if (json === null || typeof json !== 'object') return { type: typeof json };
++  const o = json as Record<string, unknown>;
++  const summary: Record<string, unknown> = {};
++  for (const k of ['ret', 'retmsg', 'errcode', 'errmsg']) {
++    if (o[k] !== undefined) summary[k] = o[k];
++  }
++  if (Array.isArray(o.msgs)) summary.msgCount = o.msgs.length;
++  if (typeof o.get_updates_buf === 'string') summary.hasBuf = o.get_updates_buf.length > 0;
++  return summary;
++}
++
 +const TRUSTED_HOSTS = ['weixin.qq.com', 'wechat.com'];
 +
 +/**
@@ -783,7 +879,7 @@ index 0b9444d..c4df7fc 100644
  export class WeChatApi {
    private readonly token: string;
    private readonly baseUrl: string;
-@@ -22,19 +39,9 @@ export class WeChatApi {
+@@ -22,19 +57,9 @@ export class WeChatApi {
    private static readonly MIN_SEND_INTERVAL = 2500;
  
    constructor(token: string, baseUrl: string = 'https://ilinkai.weixin.qq.com') {
@@ -806,6 +902,24 @@ index 0b9444d..c4df7fc 100644
      }
      this.token = token;
      this.baseUrl = baseUrl.replace(/\/+$/, '');
+@@ -60,7 +85,7 @@ export class WeChatApi {
+ 
+     const url = `${this.baseUrl}/${path}`;
+ 
+-    logger.debug('API request', { url, body });
++    logger.debug('API request', LOG_FULL_BODY ? { url, body } : { url });
+ 
+     try {
+       const res = await fetch(url, {
+@@ -76,7 +101,7 @@ export class WeChatApi {
+       }
+ 
+       const json = (await res.json()) as T;
+-      logger.debug('API response', json);
++      logger.debug('API response', LOG_FULL_BODY ? json : summarizeResp(json));
+       return json;
+     } catch (err) {
+       if (err instanceof DOMException && err.name === 'AbortError') {
 diff --git a/src/wechat/cdn.ts b/src/wechat/cdn.ts
 index da9a22b..417c6f6 100644
 --- a/src/wechat/cdn.ts

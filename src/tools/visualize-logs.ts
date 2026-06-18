@@ -12,7 +12,7 @@
 import { readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 
 const DATA_DIR = process.env.WCC_DATA_DIR || join(homedir(), '.wechat-claude-code');
 
@@ -718,10 +718,12 @@ function main() {
   const html = generateHtml(sessions, date);
 
   if (output) {
-    writeFileSync(output, html, 'utf-8');
+    // Report contains full conversation transcripts — owner-only.
+    writeFileSync(output, html, { encoding: 'utf-8', mode: 0o600 });
     console.log(`Written to: ${output}`);
     if (open) {
-      execSync(`open "${output}"`);
+      // execFile (no shell): a filename with shell metacharacters can't inject.
+      execFileSync('open', [output]);
     }
   } else {
     process.stdout.write(html);

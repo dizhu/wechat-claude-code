@@ -14,6 +14,24 @@ function generateUin(): string {
   return Buffer.from(buf).toString('base64');
 }
 
+// Full request/response bodies carry conversation text, file names and cursors
+// that the key-name redactor does not mask. Log only a summary by default;
+// set WCC_LOG_FULL_BODY=1 to dump everything when debugging.
+const LOG_FULL_BODY = process.env.WCC_LOG_FULL_BODY === '1';
+
+/** Summarize an API response for logging without dumping message contents. */
+function summarizeResp(json: unknown): Record<string, unknown> {
+  if (json === null || typeof json !== 'object') return { type: typeof json };
+  const o = json as Record<string, unknown>;
+  const summary: Record<string, unknown> = {};
+  for (const k of ['ret', 'retmsg', 'errcode', 'errmsg']) {
+    if (o[k] !== undefined) summary[k] = o[k];
+  }
+  if (Array.isArray(o.msgs)) summary.msgCount = o.msgs.length;
+  if (typeof o.get_updates_buf === 'string') summary.hasBuf = o.get_updates_buf.length > 0;
+  return summary;
+}
+
 const TRUSTED_HOSTS = ['weixin.qq.com', 'wechat.com'];
 
 /**
@@ -67,7 +85,7 @@ export class WeChatApi {
 
     const url = `${this.baseUrl}/${path}`;
 
-    logger.debug('API request', { url, body });
+    logger.debug('API request', LOG_FULL_BODY ? { url, body } : { url });
 
     try {
       const res = await fetch(url, {
@@ -83,7 +101,7 @@ export class WeChatApi {
       }
 
       const json = (await res.json()) as T;
-      logger.debug('API response', json);
+      logger.debug('API response', LOG_FULL_BODY ? json : summarizeResp(json));
       return json;
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {

@@ -32,20 +32,27 @@ export function redact(obj: unknown): string {
   let safe = raw;
   // Mask Bearer tokens: "Bearer <anything>"
   safe = safe.replace(/Bearer\s+[^\s"\\]+/gi, "Bearer ***");
-  // Mask generic token/secret/password/api_key values in JSON
-  // Matches both snake_case (bot_token) and camelCase (botToken)
+  // Mask sensitive JSON string values by key name. Matches snake_case,
+  // camelCase and kebab-case keys whose name contains a sensitive substring
+  // (token, secret, password, api[-_]?key, aes[-_]?key, EncodingAESKey,
+  // credential, authorization, signature).
   safe = safe.replace(
-    /"(?:(?:[\w]+_)?[Tt]oken|(?:[\w]+_)?[Ss]ecret|(?:[\w]+_)?[Pp]assword|(?:[\w]+_)?api_key|[Aa]es_[Kk]ey)"\s*:\s*"[^"]*"/gi,
-    (match) => {
-      const key = match.match(/"[^"]*"/)?.[0] ?? '""';
-      return `${key}: "***"`;
-    },
+    /"([^"]*?(?:token|secret|password|api[-_]?key|aes[-_]?key|encodingaeskey|credential|authorization|signature)[^"]*?)"\s*:\s*"[^"]*"/gi,
+    (_match, key: string) => `"${key}": "***"`,
+  );
+  // Mask credentials embedded in URLs (userinfo form: scheme://user:pass@host)
+  safe = safe.replace(/([a-z][a-z0-9+.\-]*:\/\/)[^/@\s":]+:[^/@\s":]+@/gi, "$1***:***@");
+  // Mask sensitive query-string parameters (?token=…, &key=…, …)
+  safe = safe.replace(
+    /([?&][^=&\s"]*(?:token|secret|key|password|signature)[^=&\s"]*=)[^&\s"]+/gi,
+    "$1***",
   );
   return safe;
 }
 
 function ensureLogDir(): void {
-  mkdirSync(LOG_DIR, { recursive: true });
+  // Logs contain conversation contents — keep dir/files owner-only (like creds).
+  mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 });
   cleanupOldLogs();
 }
 
@@ -64,7 +71,8 @@ function writeLogLine(level: string, message: string, data?: unknown): void {
     parts.push(redact(data));
   }
   const line = parts.join(" ") + "\n";
-  appendFileSync(getLogFilePath(), line, "utf-8");
+  // mode applies only on file creation; new log files are owner-only (0600).
+  appendFileSync(getLogFilePath(), line, { encoding: "utf-8", mode: 0o600 });
 }
 
 export const logger = {
