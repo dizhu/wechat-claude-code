@@ -1,5 +1,5 @@
 diff --git a/src/claude/provider.ts b/src/claude/provider.ts
-index ee51f50..94efb67 100644
+index fedb7a3..94efb67 100644
 --- a/src/claude/provider.ts
 +++ b/src/claude/provider.ts
 @@ -31,6 +31,8 @@ export interface QueryResult {
@@ -11,15 +11,68 @@ index ee51f50..94efb67 100644
  }
  
  // ---------------------------------------------------------------------------
-@@ -170,7 +172,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
+@@ -109,8 +111,10 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
+   let errorMessage: string | undefined;
+   let child: ChildProcess | undefined;
+   let settled = false;
++  let killGraceTimer: ReturnType<typeof setTimeout> | undefined;
+ 
+   const QUERY_TIMEOUT_MS = 60 * 60 * 1000;
++  const KILL_GRACE_MS = 5000;
+ 
+   return new Promise<QueryResult>((resolve) => {
+     const finish = (result: QueryResult) => {
+@@ -120,6 +124,21 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
+       resolve(result);
+     };
+ 
++    // Terminate the child gracefully, then force-kill if it ignores SIGTERM so
++    // an unresponsive claude process can't linger as a zombie after timeout/abort.
++    const terminateChild = () => {
++      if (!child || child.exitCode !== null || child.signalCode !== null) return;
++      child.kill('SIGTERM');
++      killGraceTimer = setTimeout(() => {
++        try {
++          if (child && child.exitCode === null && child.signalCode === null) {
++            child.kill('SIGKILL');
++          }
++        } catch { /* already gone */ }
++      }, KILL_GRACE_MS);
++      killGraceTimer.unref?.();
++    };
++
+     try {
+       child = spawn('claude', args, {
+         cwd,
+@@ -139,7 +158,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
+     // Timeout
+     const timeoutId = setTimeout(() => {
+       logger.warn('Claude CLI query timed out, killing process');
+-      child!.kill('SIGTERM');
++      terminateChild();
+       const partialText = textParts.join('\n').trim();
+       finish({
+         text: partialText,
+@@ -151,9 +170,9 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
+     // Abort handling
+     const onAbort = () => {
        logger.info('Claude CLI query aborted');
-       terminateChild();
+-      child!.kill('SIGTERM');
++      terminateChild();
        const partialText = textParts.join('\n').trim();
 -      finish({ text: partialText, sessionId });
 +      finish({ text: partialText, sessionId, aborted: true });
      };
      abortController?.signal.addEventListener('abort', onAbort, { once: true });
  
+@@ -249,6 +268,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
+     // Handle process exit
+     child.on('close', (code: number | null) => {
+       clearTimeout(timeoutId);
++      if (killGraceTimer) clearTimeout(killGraceTimer);
+       abortController?.signal.removeEventListener('abort', onAbort);
+ 
+       if (code !== 0 && code !== null && !textParts.length && !errorMessage) {
 diff --git a/src/commands/handlers.ts b/src/commands/handlers.ts
 index 25586df..b516db7 100644
 --- a/src/commands/handlers.ts
@@ -108,7 +161,7 @@ index 085d33c..1d9f4fd 100644
    if (process.platform !== "win32") {
      chmodSync(CONFIG_PATH, 0o600);
 diff --git a/src/main.ts b/src/main.ts
-index fe5906d..89f5a36 100644
+index e0bb69b..89f5a36 100644
 --- a/src/main.ts
 +++ b/src/main.ts
 @@ -6,7 +6,7 @@ import { unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -129,7 +182,7 @@ index fe5906d..89f5a36 100644
  import { MessageType, type WeixinMessage } from './wechat/types.js';
  
  // ---------------------------------------------------------------------------
-@@ -239,109 +239,211 @@ async function runSetup(): Promise<void> {
+@@ -239,98 +239,211 @@ async function runSetup(): Promise<void> {
  
  async function runDaemon(): Promise<void> {
    const config = loadConfig();
@@ -142,13 +195,7 @@ index fe5906d..89f5a36 100644
      process.exit(1);
    }
  
--  // Fail closed: the bound owner's userId is the only thing gating who can drive
--  // Claude on this machine. If it is missing, every sender would be authorized —
--  // refuse to start rather than run wide open. Re-run setup to rebind.
--  if (!account.userId) {
--    console.error('账号缺少绑定用户 (userId)，拒绝启动。请重新运行 node dist/main.js setup 完成绑定。');
--    process.exit(1);
--  }
+-  const api = new WeChatApi(account.botToken, account.baseUrl);
 +  // Fail closed per account: a bot with no bound owner would authorize every
 +  // sender, so skip it rather than run that bot wide open. Also validate the
 +  // accountId up front — it is used as a path component (sync cursor, session
@@ -165,8 +212,7 @@ index fe5906d..89f5a36 100644
 +    return true;
 +  });
 +  if (usable.length === 0) process.exit(1);
- 
--  const api = new WeChatApi(account.botToken, account.baseUrl);
++
    const sessionStore = createSessionStore();
 -  const session: Session = sessionStore.load(account.accountId);
 +  const monitors = usable.map((account) => createBotMonitor(account, sessionStore, config));
@@ -268,15 +314,21 @@ index fe5906d..89f5a36 100644
 +  /** Filesystem-safe short id for a per-user working directory. */
 +  function shortId(userId: string): string {
 +    return userId.replace(/@.*$/, '').replace(/[^a-zA-Z0-9_-]/g, '') || 'user';
-+  }
-+
+   }
+ 
+-  // -- Wire the monitor callbacks --
 +  /** Owner is always allowed; everyone else must be in the config allowlist. */
 +  function isAuthorized(userId: string): boolean {
 +    if (userId === owner) return true;
 +    return (config.authorizedUsers ?? []).includes(userId);
-   }
++  }
  
--  // -- Wire the monitor callbacks --
+-  /** Handle priority commands (/stop, /clear) immediately, bypassing the serial queue. */
+-  function handlePriorityCommand(msg: WeixinMessage): boolean {
+-    if (msg.message_type !== MessageType.USER || !msg.item_list) return false;
+-    const text = extractTextFromItems(msg.item_list);
+-    if (!text.startsWith('/stop') && !text.startsWith('/clear')) return false;
+-    if (session.state !== 'processing') return false;
 +  /** Lazily create/restore an isolated runtime for a user on first contact. */
 +  function getRuntime(userId: string): UserRuntime {
 +    const existing = runtimes.get(userId);
@@ -299,26 +351,17 @@ index fe5906d..89f5a36 100644
 +    }
 +    try { mkdirSync(session.workingDirectory, { recursive: true }); } catch { /* best effort */ }
  
--  /** Handle priority commands (/stop, /clear) immediately, bypassing the serial queue. */
--  function handlePriorityCommand(msg: WeixinMessage): boolean {
--    if (msg.message_type !== MessageType.USER || !msg.item_list) return false;
--    // Same sender guard as the main message path — priority commands must not
--    // be a way for an unbound sender to abort/clear the owner's session.
--    if (account!.userId && msg.from_user_id !== account!.userId) return false;
--    const text = extractTextFromItems(msg.item_list);
--    if (!text.startsWith('/stop') && !text.startsWith('/clear')) return false;
--    if (session.state !== 'processing') return false;
+-    const ctrl = activeControllers.get(account!.accountId);
+-    if (ctrl) { ctrl.abort(); activeControllers.delete(account!.accountId); }
+-    session.state = 'idle';
+-    sessionStore.save(account!.accountId, session);
 +    // Reset stale non-idle state left over from a crash.
 +    if (session.state !== 'idle') {
 +      logger.warn('Resetting stale session state on startup', { userId, state: session.state });
 +      session.state = 'idle';
 +    }
 +    sessionStore.save(key, session);
- 
--    const ctrl = activeControllers.get(account!.accountId);
--    if (ctrl) { ctrl.abort(); activeControllers.delete(account!.accountId); }
--    session.state = 'idle';
--    sessionStore.save(account!.accountId, session);
++
 +    const rt: UserRuntime = { session, queue: [], processing: false };
 +    runtimes.set(userId, rt);
 +    return rt;
@@ -411,7 +454,7 @@ index fe5906d..89f5a36 100644
  }
  
  // ---------------------------------------------------------------------------
-@@ -351,22 +453,20 @@ async function runDaemon(): Promise<void> {
+@@ -340,22 +453,20 @@ async function runDaemon(): Promise<void> {
  async function handleMessage(
    msg: WeixinMessage,
    account: AccountData,
@@ -437,7 +480,7 @@ index fe5906d..89f5a36 100644
  
    // Extract text from items
    const userText = extractTextFromItems(msg.item_list);
-@@ -383,14 +483,18 @@ async function handleMessage(
+@@ -372,14 +483,18 @@ async function handleMessage(
    if (userText.startsWith('/')) {
      const updateSession = (partial: Partial<Session>) => {
        Object.assign(session, partial);
@@ -459,7 +502,7 @@ index fe5906d..89f5a36 100644
        getChatHistoryText: (limit?: number) => sessionStore.getChatHistoryText(session, limit),
        text: userText,
      };
-@@ -405,7 +509,7 @@ async function handleMessage(
+@@ -394,7 +509,7 @@ async function handleMessage(
      if (result.handled && result.claudePrompt) {
        await sendToClaude(
          result.claudePrompt, imageItem, fileItem, fromUserId, contextToken,
@@ -468,7 +511,7 @@ index fe5906d..89f5a36 100644
        );
        return;
      }
-@@ -429,7 +533,7 @@ async function handleMessage(
+@@ -418,7 +533,7 @@ async function handleMessage(
  
    await sendToClaude(
      userText, imageItem, fileItem, fromUserId, contextToken,
@@ -477,7 +520,7 @@ index fe5906d..89f5a36 100644
    );
  }
  
-@@ -444,6 +548,7 @@ async function sendToClaude(
+@@ -433,6 +548,7 @@ async function sendToClaude(
    fromUserId: string,
    contextToken: string,
    account: AccountData,
@@ -485,7 +528,7 @@ index fe5906d..89f5a36 100644
    session: Session,
    sessionStore: ReturnType<typeof createSessionStore>,
    sender: ReturnType<typeof createSender>,
-@@ -452,11 +557,11 @@ async function sendToClaude(
+@@ -441,11 +557,11 @@ async function sendToClaude(
  ): Promise<void> {
    // Set state to processing
    session.state = 'processing';
@@ -499,7 +542,7 @@ index fe5906d..89f5a36 100644
  
    // Flush timer for streaming text to WeChat during query (declared here for finally cleanup)
    let flushTimer: ReturnType<typeof setInterval> | undefined;
-@@ -566,7 +671,7 @@ async function sendToClaude(
+@@ -555,7 +671,7 @@ async function sendToClaude(
        model: session.model,
        systemPrompt: [
          '你正在通过微信与用户对话，不是在终端里。不要让用户去终端操作。如果用户需要文件，直接输出文件地址就行，会自动识别解析推送文件到用户的微信中。',
@@ -508,7 +551,7 @@ index fe5906d..89f5a36 100644
        ].filter(Boolean).join('\n'),
        abortController,
        images,
-@@ -591,14 +696,27 @@ async function sendToClaude(
+@@ -580,14 +696,27 @@ async function sendToClaude(
  
      let result = await claudeQuery(queryOptions);
  
@@ -537,7 +580,20 @@ index fe5906d..89f5a36 100644
      }
  
      // Stop periodic flush and send any remaining buffered content
-@@ -632,7 +750,7 @@ async function sendToClaude(
+@@ -609,7 +738,11 @@ async function sendToClaude(
+       }
+     } else if (result.error) {
+       logger.error('Claude query error', { error: result.error });
+-      await sender.sendText(fromUserId, contextToken, 'Claude 处理请求时出错，请稍后重试。');
++      // Surface the actual error (truncated) instead of a generic message — the
++      // most common first-run failures (claude not on PATH, auth failure) are
++      // otherwise invisible from the phone and only visible in the daemon log.
++      const detail = String(result.error).slice(0, 300);
++      await sender.sendText(fromUserId, contextToken, `Claude 处理请求时出错：${detail}`);
+     } else if (!anySent) {
+       await sender.sendText(fromUserId, contextToken, 'Claude 无返回内容（可能因权限被拒而终止）');
+     }
+@@ -617,7 +750,7 @@ async function sendToClaude(
      // Update session with new SDK session ID
      session.sdkSessionId = result.sessionId || undefined;
      session.state = 'idle';
@@ -546,7 +602,7 @@ index fe5906d..89f5a36 100644
  
      // Auto-push deliverable files mentioned in Claude's response
      if (result.text) {
-@@ -689,13 +807,13 @@ async function sendToClaude(
+@@ -674,13 +807,13 @@ async function sendToClaude(
        await sender.sendText(fromUserId, contextToken, '处理消息时出错，请稍后重试。');
      }
      session.state = 'idle';
@@ -614,8 +670,83 @@ index aa057a8..f665663 100644
 +    return [];
 +  }
 +}
+diff --git a/src/wechat/api.ts b/src/wechat/api.ts
+index 0b9444d..c4df7fc 100644
+--- a/src/wechat/api.ts
++++ b/src/wechat/api.ts
+@@ -14,6 +14,23 @@ function generateUin(): string {
+   return Buffer.from(buf).toString('base64');
+ }
+ 
++const TRUSTED_HOSTS = ['weixin.qq.com', 'wechat.com'];
++
++/**
++ * Whether a URL is an https endpoint on a trusted WeChat/Tencent host. Used to
++ * vet both the configured baseUrl and any server-supplied URL (e.g. CDN upload
++ * targets) before we send encrypted file contents to it.
++ */
++export function isTrustedWechatUrl(value: string): boolean {
++  try {
++    const url = new URL(value);
++    if (url.protocol !== 'https:') return false;
++    return TRUSTED_HOSTS.some(h => url.hostname === h || url.hostname.endsWith('.' + h));
++  } catch {
++    return false;
++  }
++}
++
+ export class WeChatApi {
+   private readonly token: string;
+   private readonly baseUrl: string;
+@@ -22,19 +39,9 @@ export class WeChatApi {
+   private static readonly MIN_SEND_INTERVAL = 2500;
+ 
+   constructor(token: string, baseUrl: string = 'https://ilinkai.weixin.qq.com') {
+-    if (baseUrl) {
+-      try {
+-        const url = new URL(baseUrl);
+-        const allowedHosts = ['weixin.qq.com', 'wechat.com'];
+-        const isAllowed = allowedHosts.some(h => url.hostname === h || url.hostname.endsWith('.' + h));
+-        if (url.protocol !== 'https:' || !isAllowed) {
+-          logger.warn('Untrusted baseUrl, using default', { baseUrl });
+-          baseUrl = 'https://ilinkai.weixin.qq.com';
+-        }
+-      } catch {
+-        logger.warn('Invalid baseUrl, using default', { baseUrl });
+-        baseUrl = 'https://ilinkai.weixin.qq.com';
+-      }
++    if (baseUrl && !isTrustedWechatUrl(baseUrl)) {
++      logger.warn('Untrusted baseUrl, using default', { baseUrl });
++      baseUrl = 'https://ilinkai.weixin.qq.com';
+     }
+     this.token = token;
+     this.baseUrl = baseUrl.replace(/\/+$/, '');
+diff --git a/src/wechat/media.ts b/src/wechat/media.ts
+index f8e66e7..e841cca 100644
+--- a/src/wechat/media.ts
++++ b/src/wechat/media.ts
+@@ -124,8 +124,18 @@ export async function downloadFile(item: MessageItem): Promise<string | null> {
+     const decrypted = await downloadAndDecrypt(encryptQueryParam, aesKey);
+     const tmpDir = path.join(os.tmpdir(), 'wechat-claude-code');
+     fs.mkdirSync(tmpDir, { recursive: true });
+-    const fileName = fileItem.file_name || `file-${Date.now()}.bin`;
++    // Strip any directory components from the server-supplied name to keep the
++    // write contained in tmpDir (prevents path traversal via crafted file_name).
++    const rawName = fileItem.file_name || `file-${Date.now()}.bin`;
++    const fileName = path.basename(rawName) || `file-${Date.now()}.bin`;
+     const filePath = path.join(tmpDir, fileName);
++    // Defense in depth: confirm the resolved path is actually inside tmpDir
++    // before writing, in case basename ever fails to fully contain the name.
++    const resolvedDir = path.resolve(tmpDir);
++    if (path.dirname(path.resolve(filePath)) !== resolvedDir) {
++      logger.warn('Rejected unsafe file name', { rawName });
++      return null;
++    }
+     fs.writeFileSync(filePath, decrypted);
+     logger.info('File downloaded and saved', { path: filePath, size: decrypted.length, name: fileName });
+     return filePath;
 diff --git a/src/wechat/monitor.ts b/src/wechat/monitor.ts
-index 4d4fd17..45f47d2 100644
+index 4d4fd17..e620b3a 100644
 --- a/src/wechat/monitor.ts
 +++ b/src/wechat/monitor.ts
 @@ -14,7 +14,7 @@ export interface MonitorCallbacks {
@@ -627,7 +758,7 @@ index 4d4fd17..45f47d2 100644
    const controller = new AbortController();
    let stopped = false;
    const recentMsgIds = new Set<number>();
-@@ -25,7 +25,7 @@ export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks) {
+@@ -25,12 +25,16 @@ export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks) {
  
      while (!controller.signal.aborted) {
        try {
@@ -636,7 +767,28 @@ index 4d4fd17..45f47d2 100644
          logger.debug('Polling for messages', { hasBuf: buf.length > 0 });
  
          const resp = await api.getUpdates(buf || undefined);
-@@ -44,7 +44,7 @@ export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks) {
+ 
+-        if (resp.ret === SESSION_EXPIRED_ERRCODE) {
++        // The server signals errors via either ret/retmsg or errcode/errmsg.
++        const code = resp.ret ?? resp.errcode;
++        const codeMsg = resp.retmsg ?? resp.errmsg;
++
++        if (code === SESSION_EXPIRED_ERRCODE) {
+           logger.warn('Session expired, pausing for 1 hour');
+           callbacks.onSessionExpired();
+           await sleep(SESSION_EXPIRED_PAUSE_MS, controller.signal);
+@@ -38,13 +42,16 @@ export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks) {
+           continue;
+         }
+ 
+-        if (resp.ret !== undefined && resp.ret !== 0) {
+-          logger.warn('getUpdates returned error', { ret: resp.ret, retmsg: resp.retmsg });
++        if (code !== undefined && code !== 0) {
++          logger.warn('getUpdates returned error', { ret: code, retmsg: codeMsg });
++          // Unknown error code: back off instead of hot-looping the API.
++          await sleep(BACKOFF_SHORT_MS, controller.signal);
++          continue;
+         }
  
          // Save the new sync buffer regardless of ret
          if (resp.get_updates_buf) {
@@ -676,10 +828,34 @@ index 161f121..e9734e6 100644
 +export function saveSyncBuf(accountId: string, buf: string): void {
 +  saveJson(syncBufPath(accountId), buf);
  }
+diff --git a/src/wechat/types.ts b/src/wechat/types.ts
+index 5bd3c16..c33c503 100644
+--- a/src/wechat/types.ts
++++ b/src/wechat/types.ts
+@@ -95,6 +95,10 @@ export interface GetUpdatesReq {
+ export interface GetUpdatesResp {
+   ret?: number;
+   retmsg?: string;
++  // The server reports getupdates errors via errcode/errmsg (e.g. session
++  // timeout -14), NOT ret/retmsg. Both shapes must be handled.
++  errcode?: number;
++  errmsg?: string;
+   sync_buf: string;
+   get_updates_buf: string;
+   msgs?: WeixinMessage[];
 diff --git a/src/wechat/upload.ts b/src/wechat/upload.ts
-index a4c9676..d1f6817 100644
+index 8ff88d3..d1f6817 100644
 --- a/src/wechat/upload.ts
 +++ b/src/wechat/upload.ts
+@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
+ import { readFileSync, statSync } from 'node:fs';
+ import { basename, extname } from 'node:path';
+ import { encryptAesEcb, aesEcbPaddedSize } from './crypto.js';
+-import { WeChatApi } from './api.js';
++import { WeChatApi, isTrustedWechatUrl } from './api.js';
+ import { UploadMediaType } from './types.js';
+ import { CDN_BASE_URL } from '../constants.js';
+ import { logger } from '../logger.js';
 @@ -65,10 +65,16 @@ export async function uploadFile(
      },
    });
@@ -699,3 +875,16 @@ index a4c9676..d1f6817 100644
    }
  
    // Encrypt
+@@ -77,6 +83,12 @@ export async function uploadFile(
+   // Build CDN upload URL
+   let uploadUrl: string;
+   if (uploadResp.upload_full_url) {
++    // The upload target comes from the API response — vet it against the same
++    // trusted-host allowlist before POSTing encrypted file bytes to it, so a
++    // spoofed/MITM'd response can't redirect uploads to an attacker host.
++    if (!isTrustedWechatUrl(uploadResp.upload_full_url)) {
++      throw new Error('上传地址不可信，已拒绝上传');
++    }
+     uploadUrl = uploadResp.upload_full_url;
+   } else {
+     uploadUrl = `${CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(uploadResp.upload_param!)}&filekey=${fileKey}`;

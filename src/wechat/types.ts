@@ -95,6 +95,10 @@ export interface GetUpdatesReq {
 export interface GetUpdatesResp {
   ret?: number;
   retmsg?: string;
+  // The server reports getupdates errors via errcode/errmsg (e.g. session
+  // timeout -14), NOT ret/retmsg. Both shapes must be handled.
+  errcode?: number;
+  errmsg?: string;
   sync_buf: string;
   get_updates_buf: string;
   msgs?: WeixinMessage[];

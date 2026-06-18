@@ -137,3 +137,11 @@ API 被 MITM/劫持时，加密文件会被上传到攻击者主机。
 4. **drainQueue 顺序不变式注释**：标注「先清 `processing` 再查队列」的不变式，防未来重排引入竞态。
 
 **final review 复核为安全的**：clean-stop 路径不会空转（`process.exit` 先于 `Promise.all` settle）；`workspaceInitialized` 经 `/clear` 保留；`sharedCtx` 已无残留引用；`uploadResp.ret` 类型存在；abort 早返回时 finally 仍清理 flushTimer/typing。
+
+---
+
+## 第六批：getupdates 错误码热循环修复（2026-06-18，编译验证 ✅）
+
+涉及文件：`src/wechat/monitor.ts`、`src/wechat/types.ts`
+
+1. **【重要】session timeout 不退避导致热循环轰炸接口**（`monitor.ts` + `types.ts`）：`getupdates` 出错时服务端返回的是 `errcode`/`errmsg`（如 session 超时 `errcode:-14`），而轮询循环只判断 `resp.ret`。字段名对不上 → `ret` 为 `undefined` → 既不触发「过期暂停 1 小时」、也不进异常退避分支 → 循环立刻空转，实测约 **20 次/秒**无延迟轰炸 ilink 接口（实跑 500 行日志里 166 次 -14）。在「一个微信号同一时刻只有一个活 session」的现实下，任一 bot 掉线（被另一台机器或新扫码顶下线）就会触发此热循环，正是反外挂封号的高危行为。**修复**：① `GetUpdatesResp` 类型补上 `errcode`/`errmsg`；② monitor 用 `code = resp.ret ?? resp.errcode` 归一化，-14 走暂停分支，其余非 0 错误码打日志后 `BACKOFF_SHORT_MS`(3s) 退避再继续，不再空转。**已编译验证**。

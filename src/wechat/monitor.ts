@@ -30,7 +30,11 @@ export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks, accou
 
         const resp = await api.getUpdates(buf || undefined);
 
-        if (resp.ret === SESSION_EXPIRED_ERRCODE) {
+        // The server signals errors via either ret/retmsg or errcode/errmsg.
+        const code = resp.ret ?? resp.errcode;
+        const codeMsg = resp.retmsg ?? resp.errmsg;
+
+        if (code === SESSION_EXPIRED_ERRCODE) {
           logger.warn('Session expired, pausing for 1 hour');
           callbacks.onSessionExpired();
           await sleep(SESSION_EXPIRED_PAUSE_MS, controller.signal);
@@ -38,8 +42,11 @@ export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks, accou
           continue;
         }
 
-        if (resp.ret !== undefined && resp.ret !== 0) {
-          logger.warn('getUpdates returned error', { ret: resp.ret, retmsg: resp.retmsg });
+        if (code !== undefined && code !== 0) {
+          logger.warn('getUpdates returned error', { ret: code, retmsg: codeMsg });
+          // Unknown error code: back off instead of hot-looping the API.
+          await sleep(BACKOFF_SHORT_MS, controller.signal);
+          continue;
         }
 
         // Save the new sync buffer regardless of ret
